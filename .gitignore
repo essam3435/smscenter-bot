@@ -1,0 +1,4 @@
+*.session
+*.session-journal
+state.json
+.smscenter_bot.json

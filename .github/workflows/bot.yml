@@ -28,9 +28,13 @@ jobs:
         env:
           SMSCENTER_BOT_TOKEN: ${{ secrets.SMSCENTER_BOT_TOKEN }}
           SMSCENTER_ADMIN_ID: ${{ secrets.SMSCENTER_ADMIN_ID }}
-          SMSCENTER_API_KEY: ${{ secrets.SMSCENTER_API_KEY }}
           SMSCENTER_BOT_STATE: state.json
-        run: python smscenter_price_bot.py
+          SMSCENTER_TG_API_ID: ${{ secrets.TG_API_ID }}
+          SMSCENTER_TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+        run: |
+          if [ -n "$TG_SESSION_B64" ]; then echo "$TG_SESSION_B64" | base64 -d > gh_checker.session; fi
+          python smscenter_price_bot.py
 
       - name: Save state
         if: always()
