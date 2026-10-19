@@ -1,0 +1,52 @@
+name: bot
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: bot-state-never-matches
+          restore-keys: bot-state
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          SMSCENTER_BOT_TOKEN: ${{ secrets.SMSCENTER_BOT_TOKEN }}
+          SMSCENTER_ADMIN_ID: ${{ secrets.SMSCENTER_ADMIN_ID }}
+          SMSCENTER_API_KEY: ${{ secrets.SMSCENTER_API_KEY }}
+          SMSCENTER_BOT_STATE: state.json
+        run: python smscenter_price_bot.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: bot-state-${{ github.run_id }}
+
+      - name: Restart
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'bot.yml',
+              ref: 'main'
+            })
