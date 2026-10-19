@@ -48,5 +48,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'bot.yml',
-              ref: 'main'
+              ref: 'master'
             })
