@@ -70,6 +70,11 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+HERE_DIR = os.path.dirname(os.path.abspath(__file__))
+if HERE_DIR not in sys.path:
+    sys.path.insert(0, HERE_DIR)
+import catchall  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.environ.get("SMSCENTER_BOT_STATE") or os.path.join(HERE, ".smscenter_bot.json")
 BASE_URL = "https://smscenter.pro/api"
@@ -395,7 +400,8 @@ def new_watch(wid: str, svc: str, sname: str, limit: float) -> dict:
 
 PROFILE_DEFAULTS: dict[str, Any] = {"api_key": "", "interval": 60, "drop_pct": 5.0, "paused": False, "service": DEFAULT_SVC,
                                     "endpoints": list(ENDPOINTS), "tracks": {}, "last": {}, "hist": {}, "mute_until": 0.0, "last_poll": 0.0,
-                                    "watches": {}, "watch_interval": 120.0, "hunters": {}, "history": []}
+                                    "watches": {}, "watch_interval": 120.0, "hunters": {}, "history": [],
+                                    "mail": {"domain": "", "gmail": "", "app_password": "", "n": 0, "generated": []}}
 
 
 def normalize(d: dict) -> dict:
@@ -497,6 +503,13 @@ class UserState:
     @property
     def api_key(self) -> str:
         return unseal(self.d["api_key"])
+
+    @property
+    def mail(self) -> dict:
+        m = self.d.setdefault("mail", {})
+        for k, v in PROFILE_DEFAULTS["mail"].items():
+            m.setdefault(k, json.loads(json.dumps(v)))
+        return m
 
     @property
     def endpoints(self) -> list[str]:
@@ -1061,6 +1074,9 @@ class App:
         self.checker = CHECKER                                  # shared Telegram-checker (one Telethon session for the whole bot)
         self.hunts: dict[str, asyncio.Task] = {}                # hunter id -> running hunt loop
         self.code_tasks: dict[str, asyncio.Task] = {}           # bought number (idNum) -> waiting for its code
+        self.mail_task: asyncio.Task | None = None              # watches the catch-all Gmail for new mail
+        self.mail_err = ""
+        self.wipe_input = False                                 # the message just typed holds a secret: delete it
 
     async def notify(self, text: str):
         if not (self.uid and self.bot):
@@ -1133,6 +1149,9 @@ class App:
             t.cancel()
         self.hunts.clear()
         self.code_tasks.clear()
+        if self.mail_task:
+            self.mail_task.cancel()
+            self.mail_task = None
 
     # -- countries + platforms
     async def load_countries(self) -> list[dict]:
@@ -1245,7 +1264,8 @@ class App:
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
         txt += "\n<i>⏸ Pause only stops the price monitoring - hunters keep hunting.</i>"
         kb = [[("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
-              [("📱 Platforms", "pl:0"), ("📋 Tracked", "t:l")],
+              [("📧 Email", "em:m"), ("📱 Platforms", "pl:0")],
+              [("📋 Tracked", "t:l")],
               [("⚙️ Settings", "s:m"), ("📜 History", "hi:0")],
               [("▶️ Resume monitoring" if s["paused"] else "⏸ Pause monitoring", "s:pause"), ("🔄 Check now", "k")]]
         return txt, kb
@@ -1407,6 +1427,8 @@ class App:
             return None
         if k == "hu":
             return await self.ui_hunt(uid, p)
+        if k == "em":
+            return await self.ui_email(uid, p)
         if k == "rl":
             return await self.release(p[1])
         if k == "hi":
@@ -1529,6 +1551,8 @@ class App:
     # -- typed values (after pressing "Type seconds" / "Set drop amount" / "Set price limit")
     async def take_value(self, uid: int, text: str) -> Reply:
         field, svc, cc = self.pending.pop(uid)
+        if field in ("emdomain", "emgmail", "empass"):
+            return await self.take_email_value(field, text)
         if field in ("hcsearch", "hprefix", "hmax", "hint", "hmin"):
             return await self.take_hunt_value(uid, field, svc, text)
         if field in ("wprice", "wlimit", "wint", "wstock"):
@@ -2216,8 +2240,170 @@ class App:
                 pass
             self.code_tasks.pop(id_num, None)
 
+    # -- catch-all e-mail: your domain forwards everything to your Gmail; the bot makes believable addresses and hands you the codes that arrive
+    def mail_cfg(self) -> tuple[str, str, str] | None:
+        m = self.s.mail
+        return (m["gmail"], unseal(m["app_password"]), m["domain"]) if (m["domain"] and m["gmail"] and m["app_password"]) else None
+
+    def start_mail(self) -> None:
+        if self.mail_task is None or self.mail_task.done():
+            self.mail_task = asyncio.create_task(self.mail_loop())
+
+    async def mail_loop(self) -> None:
+        w = catchall.MailWatch()
+        try:
+            while True:
+                cfg = self.mail_cfg()
+                if not cfg:
+                    w.close()
+                    await asyncio.sleep(10)
+                    continue
+                delay = 6.0
+                try:
+                    for it in await asyncio.to_thread(w.poll, *cfg):
+                        await self.mail_notify(it)
+                    self.mail_err = ""
+                except Exception as e:                                   # noqa: BLE001
+                    w.close()
+                    delay = 30.0
+                    err = f"{type(e).__name__}: {str(e)[:100]}"
+                    log.warning("mail watcher: %s", err)
+                    if err != self.mail_err:
+                        self.mail_err = err
+                        await self.notify(f"⚠️ Email watcher can't read your Gmail ({html.escape(err)}). I keep retrying - check the App password in 📧 Email.")
+                await asyncio.sleep(delay)
+        finally:
+            w.close()
+
+    def mail_rec(self, key: str, by: str = "id") -> dict | None:
+        return next((r for r in self.s.mail["generated"] if r.get(by) == key), None)
+
+    async def mail_notify(self, it: dict) -> None:
+        rec = self.mail_rec(it["to"], "addr")
+        body = it["body"][:300] + ("…" if len(it["body"]) > 300 else "")
+        txt = (f"📧 <b>New email</b> → <code>{html.escape(it['to'])}</code>\n"
+               f"From: {html.escape(it['from'][:80])}\nSubject: {html.escape(it['subject'][:120])}\n")
+        if it.get("code"):
+            txt += f"\n🔑 <b>Code:</b> <code>{it['code']}</code>\n"
+        if body:
+            txt += f"\n<i>{html.escape(body)}</i>"
+        kb: KB = []
+        if it.get("code"):
+            kb.append([(f"📋 Copy code {it['code']}", f"copy:{it['code']}")])
+        kb.append([("📋 Copy email", f"copy:{it['to']}")])
+        kb.append([("📥 Inbox", f"em:i:{rec['id']}")] if rec else [("📧 Email", "em:m")])
+        await self.notify_kb(txt, kb)
+
+    def email_menu(self, note: str = "") -> Reply:
+        m = self.s.mail
+        ok = lambda v: f"<code>{html.escape(v)}</code> ✅" if v else "not set ❗"                      # noqa: E731
+        txt = ("📧 <b>Catch-all email</b>\n"
+               f"🌐 Domain: {ok(m['domain'])}\n📮 Gmail: {ok(m['gmail'])}\n🔑 App password: {'set ✅' if m['app_password'] else 'not set ❗'}\n\n"
+               "Point your domain's <b>catch-all</b> at that Gmail. Then <b>Generate</b> gives you a real-looking address on your domain - "
+               "when a code or mail arrives for it, I send it here with a copy button.")
+        if note:
+            txt = note + "\n\n" + txt
+        kb: KB = []
+        if self.mail_cfg():
+            kb.append([("✉️ Generate email", "em:g"), ("📋 My emails", "em:l")])
+        kb += [[("🌐 Domain", "em:s:d"), ("📮 Gmail", "em:s:g")], [("🔑 App password", "em:s:p")], [("🏠 Menu", "m")]]
+        return txt, kb
+
+    def email_card(self, rec: dict, note: str = "") -> Reply:
+        txt = f"✉️ <b>{html.escape(note or 'Your email')}</b>\n<code>{html.escape(rec['addr'])}</code>\n👤 {html.escape(rec['name'])}\n\n<i>Codes and mails sent to it show up here by themselves.</i>"
+        return txt, [[("📋 Copy email", f"copy:{rec['addr']}")], [("📋 Copy name", f"copy:{rec['name']}")],
+                     [("📥 Inbox", f"em:i:{rec['id']}"), ("🔁 Another", "em:g")], [("📧 Email", "em:m"), ("🏠 Menu", "m")]]
+
+    async def ui_email(self, uid: int, p: list[str]) -> Reply:
+        m, a = self.s.mail, (p[1] if len(p) > 1 else "m")
+        if a == "m":
+            return self.email_menu()
+        if a == "s":
+            what = p[2] if len(p) > 2 else "d"
+            field, prompt = {"d": ("emdomain", "🌐 Send your <b>domain</b> (e.g. <code>mydomain.com</code>)."),
+                             "g": ("emgmail", "📮 Send the <b>Gmail address</b> your catch-all forwards to."),
+                             "p": ("empass", "🔑 Send the Gmail <b>App password</b> (16 letters, Google account → Security → 2-Step Verification → App passwords). I delete your message right after.")}[what]
+            self.pending[uid] = (field, "", "")
+            return prompt, [[("Cancel", "em:m")]]
+        if a == "g":
+            if not self.mail_cfg():
+                return self.email_menu("Set the domain, Gmail and App password first.")
+            addr, name = catchall.generate(m["domain"], {r["addr"] for r in m["generated"]})
+            m["n"] += 1
+            rec = {"id": str(m["n"]), "addr": addr, "name": name, "ts": time.time()}
+            m["generated"] = (m["generated"] + [rec])[-60:]
+            self.s.save()
+            self.start_mail()
+            return self.email_card(rec, "New email")
+        if a == "l":
+            recs = m["generated"][-10:][::-1]
+            if not recs:
+                return "No emails generated yet.", [[("✉️ Generate email", "em:g")], [("📧 Email", "em:m")]]
+            return "📋 <b>Your emails</b> (latest first)", [[(r["addr"], f"em:v:{r['id']}")] for r in recs] + [[("📧 Email", "em:m")]]
+        rec = self.mail_rec(p[2]) if len(p) > 2 else None
+        if rec is None:
+            return self.email_menu("I don't know that email any more.")
+        if a == "v":
+            return self.email_card(rec)
+        if a == "i":
+            cfg = self.mail_cfg()
+            if not cfg:
+                return self.email_menu("Set the domain, Gmail and App password first.")
+            try:
+                mails = await catchall.inbox(cfg[0], cfg[1], rec["addr"])
+            except Exception as e:                                       # noqa: BLE001
+                return f"Could not read the Gmail: {html.escape(type(e).__name__)} {html.escape(str(e)[:100])}", [[("🔄 Retry", f"em:i:{rec['id']}")], [("📧 Email", "em:m")]]
+            txt = f"📥 <b>Inbox</b> · <code>{html.escape(rec['addr'])}</code>\n"
+            kb: KB = []
+            if not mails:
+                txt += "\nNothing has arrived yet."
+            for x in mails:
+                when = time.strftime("%H:%M", time.localtime(x["ts"])) if x["ts"] else ""
+                txt += f"\n<b>{html.escape(x['subject'][:100] or '(no subject)')}</b> {when}{' · spam' if x['spam'] else ''}\n{html.escape(x['from'][:70])}\n"
+                if x["code"]:
+                    txt += f"🔑 <code>{x['code']}</code>\n"
+                    kb.append([(f"📋 Copy code {x['code']}", f"copy:{x['code']}")])
+            return txt, kb + [[("🔄 Refresh", f"em:i:{rec['id']}"), ("⬅️ Back", f"em:v:{rec['id']}")]]
+        return self.email_menu()
+
+    async def take_email_value(self, field: str, text: str) -> Reply:
+        m, v = self.s.mail, text.strip()
+        if field == "emdomain":
+            v = re.sub(r"^(https?://)?(www\.)?|^@|/.*$", "", v.lower())
+            if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", v):
+                self.pending[self.uid] = (field, "", "")
+                return "That doesn't look like a domain. Send it like <code>mydomain.com</code>.", [[("Cancel", "em:m")]]
+            m["domain"] = v
+            self.s.save()
+            return self.email_menu("✅ Domain saved.")
+        if field == "emgmail":
+            v = v.lower()
+            if not re.fullmatch(r"[\w.+-]+@[\w-]+(\.[\w-]+)+", v):
+                self.pending[self.uid] = (field, "", "")
+                return "That doesn't look like an email address. Send your Gmail again.", [[("Cancel", "em:m")]]
+            m["gmail"] = v
+            self.s.save()
+            return self.email_menu("✅ Gmail saved.")
+        self.wipe_input = True                                           # the app password must not stay in the chat
+        v = re.sub(r"\s+", "", v)
+        if not m["gmail"]:
+            return self.email_menu("Set the Gmail address first, then the App password.")
+        if len(v) < 12:
+            self.pending[self.uid] = (field, "", "")
+            return "That is too short for a Google App password (16 letters). Send it again.", [[("Cancel", "em:m")]]
+        bad = await catchall.test_login(m["gmail"], v)
+        if bad:
+            self.pending[self.uid] = (field, "", "")
+            return f"❌ {html.escape(bad)}\nSend the App password again.", [[("Cancel", "em:m")]]
+        m["app_password"] = seal(v)
+        self.s.save()
+        self.start_mail()
+        return self.email_menu("✅ App password saved - Gmail login works. I delete your message.")
+
     def resume_watchers(self) -> None:
         """After a restart: settle numbers that were mid-check and keep watching every number that is still waiting for its code."""
+        if self.mail_cfg():
+            self.start_mail()
         for e in self.s.d["history"]:
             if e.get("chk") == "pending":
                 e["chk"], e["chk_note"] = "unknown", "the bot restarted before the check finished"
@@ -3011,7 +3197,11 @@ async def main() -> int:
     @dp.message(F.text, F.chat.type == "private")
     async def on_text(m: Message):
         res = await hub.handle(m.from_user.id, m.text)
-        if m.text.startswith("/setkey"):
+        app_ = hub.apps.get(m.from_user.id)
+        wipe = bool(app_ and app_.wipe_input)
+        if app_:
+            app_.wipe_input = False
+        if m.text.startswith("/setkey") or wipe:
             try:
                 await m.delete()                                          # don't leave the key in the chat
             except Exception:                                             # noqa: BLE001
