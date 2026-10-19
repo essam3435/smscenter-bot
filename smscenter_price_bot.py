@@ -258,7 +258,7 @@ class PhoneChecker:
     @staticmethod
     def creds() -> tuple[int, str, str] | None:
         """(api_id, api_hash, checker bot) from the environment, else from the NumberHub app's settings file (same machine, same Windows user)."""
-        api_id, api_hash, bot = os.environ.get("SMSCENTER_TG_API_ID", ""), os.environ.get("SMSCENTER_TG_API_HASH", ""), os.environ.get("SMSCENTER_CHECK_BOT", "")
+        api_id, api_hash, bot = (os.environ.get(k, "").strip().lstrip("﻿").strip() for k in ("SMSCENTER_TG_API_ID", "SMSCENTER_TG_API_HASH", "SMSCENTER_CHECK_BOT"))
         if not (api_id and api_hash):
             try:
                 with open(os.path.join(HERE, ".numberhub_settings.json"), encoding="utf-8") as f:
