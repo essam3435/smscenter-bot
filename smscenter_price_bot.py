@@ -388,8 +388,13 @@ def matches_prefix(tel, prefixes: list[str]) -> bool:
     return False
 
 
+def number_ok(tel, include: list[str], exclude: list[str]) -> bool:
+    """Kept only if it matches an 'only these' prefix (when there are any) and matches none of the 'not these' prefixes."""
+    return matches_prefix(tel, include) and not (exclude and matches_prefix(tel, exclude))
+
+
 def new_hunter(hid: str, svc: str, sname: str, cc: str, name: str) -> dict:
-    return {"id": hid, "svc": svc, "sname": sname, "cc": cc, "name": name, "op": None, "prefix": [], "maxp": None, "want": 1,
+    return {"id": hid, "svc": svc, "sname": sname, "cc": cc, "name": name, "op": None, "prefix": [], "xprefix": [], "maxp": None, "want": 1,
             "interval": 1.0, "minutes": 15.0, "until": "time", "stopchg": False, "check": True, "on": False, "got": 0, "tries": 0, "rejected": 0, "last": ""}
 
 
@@ -1553,7 +1558,7 @@ class App:
         field, svc, cc = self.pending.pop(uid)
         if field in ("emdomain", "emgmail", "empass"):
             return await self.take_email_value(field, text)
-        if field in ("hcsearch", "hprefix", "hmax", "hint", "hmin"):
+        if field in ("hcsearch", "hprefix", "hxprefix", "hmax", "hint", "hmin"):
             return await self.take_hunt_value(uid, field, svc, text)
         if field in ("wprice", "wlimit", "wint", "wstock"):
             return await self.take_watch_value(uid, field, svc, text)
@@ -1717,7 +1722,7 @@ class App:
         if h is None:
             return self.hunters_screen()
         prices, snap = await self.live_prices(h["svc"], h["cc"]) if self.s.api_key else ("Set your SmsCenter key first: /setkey", None)
-        pf = ", ".join(h["prefix"]) if h["prefix"] else "any number"
+        pf = " ".join(filter(None, ["✅ " + ", ".join(h["prefix"]) if h["prefix"] else "", "🚫 " + ", ".join(h["xprefix"]) if h["xprefix"] else ""])) or "any number"
         state = "▶️ <b>hunting</b>" if h.get("on") else "⏹ stopped"
         txt = (f"🏹 <b>Hunter #{hid}</b> {state}\n{self.hunter_title(h)}\n"
                f"Bought <b>{h['got']}/{h['want']}</b> · requests {h['tries']} · released {h['rejected']} (prefix / price)\n"
@@ -1726,7 +1731,7 @@ class App:
                + (f"\n<i>{html.escape(h['last'])}</i>" if h.get("last") else "") + f"\n\n<b>Prices now</b>\n{prices}")
         rem = max(0, h["want"] - h["got"])
         until_t = h["until"] == "time"
-        kb = [[(f"🔢 Prefix: {pf[:24]}", f"hu:w:prefix:{hid}")],
+        kb = [[(f"🔢 Prefix: {pf[:30]}", f"hu:w:prefix:{hid}")],
               [(f"💰 Max price: {usd(h['maxp']) if h['maxp'] else 'no limit'}", f"hu:w:max:{hid}")],
               [("➖", f"hu:m:{hid}"), (f"📦 Quantity: {rem} remaining (of {h['want']})", f"hu:k:{hid}"), ("➕", f"hu:a:{hid}")],
               [(f"⏱ Request every: {secs(h['interval'])}", f"hu:w:int:{hid}")],
@@ -1762,7 +1767,7 @@ class App:
             hs[hid]["interval"] = float(self.s.d.get("hunt_interval") or 1.0)
             self.s.save()
             return await self.hunter_operators(hid)
-        hid = p[2] if sub in ("k", "op", "pr", "go", "stop", "x", "xy", "a", "m", "t", "px", "pc", "z") else (p[3] if len(p) > 3 else "")
+        hid = p[2] if sub in ("k", "op", "pr", "go", "stop", "x", "xy", "a", "m", "t", "px", "xx", "pm", "pc", "z") else (p[3] if len(p) > 3 else "")
         h = hs.get(hid)
         if h is None:
             return self.hunters_screen()
@@ -1789,16 +1794,18 @@ class App:
                                         "int": f"how often to send a request, in seconds (minimum {secs(HUNT_MIN)}): <code>0.1</code>, <code>1</code>, <code>2.5</code>",
                     "min": "stop hunting after how many minutes, like <code>20</code>"}[field]
             return f"🏹 {self.hunter_title(h)}: send {what}.", [[("Cancel", f"hu:k:{hid}")] + ([("📊 Price tiers", f"hu:op:{hid}")] if field == "max" else [])]
-        if sub == "px":                                                  # hu:px:<hid>:<i>  remove one prefix
-            i = int(p[3])
-            if 0 <= i < len(h["prefix"]):
-                h["prefix"].pop(i)
+        if sub in ("px", "xx"):                                          # hu:px:<hid>:<i> remove one wanted prefix · hu:xx:<hid>:<i> remove one blocked prefix
+            lst, i = h["prefix" if sub == "px" else "xprefix"], int(p[3])
+            if 0 <= i < len(lst):
+                lst.pop(i)
                 self.s.save()
-            return self.prefix_screen(uid, hid)
-        if sub == "pc":                                                  # clear all prefixes
-            h["prefix"] = []
+            return self.prefix_screen(uid, hid, "in" if sub == "px" else "ex")
+        if sub == "pm":                                                  # hu:pm:<hid>:<in|ex>  which list the next typed prefix goes to
+            return self.prefix_screen(uid, hid, p[3])
+        if sub == "pc":                                                  # hu:pc:<hid>:<in|ex>  clear that list
+            h["prefix" if p[3] == "in" else "xprefix"] = []
             self.s.save()
-            return self.prefix_screen(uid, hid)
+            return self.prefix_screen(uid, hid, p[3])
         if sub in ("a", "m"):                                            # quantity: one more / one less remaining
             h["want"] = max(h["got"] + 1, h["want"] + (1 if sub == "a" else -1))
             self.s.save()
@@ -1834,17 +1841,22 @@ class App:
             return self.hunters_screen()
         return self.hunters_screen()
 
-    def prefix_screen(self, uid: int, hid: str) -> Reply:
+    def prefix_screen(self, uid: int, hid: str, mode: str = "in") -> Reply:
+        """Two lists: ✅ 'only these' (empty = any) and 🚫 'never these'. The next prefix you type is added to the list in `mode`."""
         h = self.s.d["hunters"][hid]
-        self.pending[uid] = ("hprefix", hid, "")
-        cur = ", ".join(h["prefix"]) if h["prefix"] else "none - any number is kept"
-        txt = (f"🏹 {self.hunter_title(h)}\n🔢 <b>Prefixes</b>: <b>{html.escape(cur)}</b>\n\n"
-               "Send a prefix to <b>add</b> it - as many as you like, one at a time or several separated by spaces.\n"
+        ex = mode == "ex"
+        self.pending[uid] = ("hxprefix" if ex else "hprefix", hid, "")
+        inc = ", ".join(h["prefix"]) if h["prefix"] else "any"
+        exc = ", ".join(h["xprefix"]) if h["xprefix"] else "none"
+        txt = (f"🏹 {self.hunter_title(h)}\n🔢 <b>Prefixes</b>\n✅ Only these: <b>{html.escape(inc)}</b>\n🚫 Never these: <b>{html.escape(exc)}</b>\n\n"
+               f"Now adding to the <b>{'🚫 NEVER' if ex else '✅ ONLY'}</b> list - send a prefix (one, or several separated by spaces).\n"
                "<code>+38067</code> = the whole number starts with it · <code>67</code> or <code>067</code> = after the country code.\n"
-               "A number matching <b>any</b> of them is kept. Tap a prefix below to remove it.")
-        kb: KB = [[(f"❌ {x}", f"hu:px:{hid}:{i}")] for i, x in enumerate(h["prefix"])]
-        if h["prefix"]:
-            kb.append([("🧹 Clear all", f"hu:pc:{hid}")])
+               "A number is kept when it matches an ✅ prefix (if you set any) and matches no 🚫 prefix. Tap a prefix below to remove it.")
+        kb: KB = [[(("✅ " if not ex else "") + "➕ Add to ONLY list", f"hu:pm:{hid}:in"), (("✅ " if ex else "") + "🚫 Add to NEVER list", f"hu:pm:{hid}:ex")]]
+        kb += [[(f"❌ ✅ {x}", f"hu:px:{hid}:{i}")] for i, x in enumerate(h["prefix"])]
+        kb += [[(f"❌ 🚫 {x}", f"hu:xx:{hid}:{i}")] for i, x in enumerate(h["xprefix"])]
+        if h["xprefix"] if ex else h["prefix"]:
+            kb.append([(f"🧹 Clear {'🚫 never' if ex else '✅ only'} list", f"hu:pc:{hid}:{'ex' if ex else 'in'}")])
         kb.append([("✅ Done", f"hu:k:{hid}")])
         return txt, kb
 
@@ -1865,15 +1877,16 @@ class App:
             return self.hunters_screen()
         back = [[("Cancel", f"hu:k:{a}")]]
         t = text.strip().lower().replace(",", ".").lstrip("$")
-        if field == "hprefix":
+        if field in ("hprefix", "hxprefix"):
+            key = "prefix" if field == "hprefix" else "xprefix"
             if t in ("off", "none", "clear", "any", "all", "no"):
-                h["prefix"] = []
+                h[key] = []
             else:
                 add = parse_prefixes(text)
                 if not add:
                     self.pending[uid] = (field, a, "")
                     return "Send a prefix like <code>+38067</code> or <code>67</code> (several: separate with spaces).", back
-                h["prefix"] = [*h["prefix"], *[x for x in add if x not in h["prefix"]]]      # typing ADDS to the list
+                h[key] = [*h[key], *[x for x in add if x not in h[key]]]                  # typing ADDS to the list
         elif field == "hmax":
             if t in ("cheapest", "min", "api"):
                 _txt, snap = await self.live_prices(h["svc"], h["cc"])
@@ -1905,8 +1918,8 @@ class App:
                 return "Send the number of minutes, like <code>20</code>.", back
             h["minutes"] = v / 60
         self.s.save()
-        if field == "hprefix":                                            # stay on the prefix list so more can be added
-            return self.prefix_screen(uid, a)
+        if field in ("hprefix", "hxprefix"):                              # stay on the prefix list so more can be added
+            return self.prefix_screen(uid, a, "ex" if field == "hxprefix" else "in")
         return await self.hunter_card(a)
 
     async def start_hunter(self, hid: str) -> Reply:
@@ -2010,7 +2023,7 @@ class App:
                     continue
                 h["tries"] += 1
                 too_dear = bool(h["maxp"] and num["price"] and num["price"] > h["maxp"] + 1e-9)
-                if not too_dear and matches_prefix(num["tel"], h["prefix"]):
+                if not too_dear and number_ok(num["tel"], h["prefix"], h["xprefix"]):
                     entry = self.record_purchase(h, num)
                     entry["chk"] = "pending" if h["check"] else "off"
                     h["got"] += 1                                        # provisional: a banned / registered result gives the place back
