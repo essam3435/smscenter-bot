@@ -36,6 +36,7 @@ jobs:
       - name: Run bot
         env:
           SMSCENTER_BOT_TOKEN: ${{ secrets.SMSCENTER_BOT_TOKEN }}
+          SMSCENTER_API_KEY: ${{ secrets.SMSCENTER_API_KEY }}
           SMSCENTER_ADMIN_ID: ${{ secrets.SMSCENTER_ADMIN_ID }}
           SMSCENTER_BOT_STATE: state.json
           SMSCENTER_TG_API_ID: ${{ secrets.TG_API_ID }}

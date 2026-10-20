@@ -128,6 +128,19 @@ DEFAULT_SERVICES = {
     "vk": "VKontakte", "ok": "Odnoklassniki", "me": "Line", "am": "Amazon", "ni": "Gojek", "ka": "Shopee", "ot": "Any other",
 }
 log = logging.getLogger("smscenter_bot")
+_SECRET_RE = re.compile(r"(?i)((?:api_?key|token)=)[^&\s'\"]+|(/bot\d+:)[\w-]+")
+
+
+def redact(s: Any) -> str:
+    """Strip API keys / tokens out of anything that is logged or sent to Telegram (URLs with ?apiKey=..., /bot<token>/...)."""
+    return _SECRET_RE.sub(lambda m: (m.group(1) or m.group(2)) + "***", str(s))
+
+
+class RedactFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
 KB = list[list[tuple[str, str]]]
 Reply = tuple[str, "KB | None"]
 
@@ -599,7 +612,7 @@ class SmsCenter:
             r = await self.http.get(BASE_URL + path, params=q)
             data = r.json()
         except httpx.HTTPError as e:
-            raise SmsCenterError(f"network error: {e}") from e
+            raise SmsCenterError(f"network error: {redact(e)}") from e
         except ValueError:
             raise SmsCenterError(f"bad response (HTTP {r.status_code})")
         if isinstance(data, dict) and data.get("error"):
@@ -658,7 +671,7 @@ class SmsCenter:
         try:
             r = await self.http.get(V0_URL, params={"api_key": self.api_key, "action": "getStatus", "id": id_num})
         except httpx.HTTPError as e:
-            raise SmsCenterError(f"network error: {e}") from e
+            raise SmsCenterError(f"network error: {redact(e)}") from e
         t = r.text.strip()
         if t.startswith("STATUS_OK"):
             return "ok", (t.split(":", 1)[1].strip() if ":" in t else None) or None
@@ -3373,6 +3386,10 @@ async def setup(st: Store, force: bool = False) -> bool:
 
 async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    for h in logging.getLogger().handlers:
+        h.setFormatter(RedactFormatter(h.formatter._fmt if h.formatter else None))
+    for n in ("httpx", "httpcore"):                      # their INFO lines carry full request URLs, key included
+        logging.getLogger(n).setLevel(logging.WARNING)
     from aiogram import Bot, Dispatcher, F
     from aiogram.types import BotCommand, CallbackQuery, Message
 
