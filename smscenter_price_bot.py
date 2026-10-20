@@ -3151,6 +3151,8 @@ class Hub:
             if data == "sess:x":
                 await self.login_drop(uid)
                 return "Cancelled.", _nav()
+            if data == "sess:qr":
+                return await self.login_qr(uid)
             if data == "sess:log":
                 return self.login_log(uid), [[("📜 Refresh", "sess:log"), ("Cancel", "sess:x")]]
             if data in ("sess:sms", "sess:call"):
@@ -3174,6 +3176,8 @@ class Hub:
         if st:
             if st.get("timer"):
                 st["timer"].cancel()
+            if st.get("qr_task"):
+                st["qr_task"].cancel()
             if st.get("client"):
                 try:
                     await st["client"].disconnect()
@@ -3202,7 +3206,7 @@ class Hub:
         self.login_arm(uid, st)
         self.app(uid).wipe_input = False
         return ("🔐 <b>New checker session</b>\nSend the phone number of the Telegram account the checker should use, in international format (<code>+15551234567</code>). "
-                "I delete your message right after.\n<i>The old session file is replaced.</i>"), [[("Cancel", "sess:x")]]
+                "I delete your message right after.\n<i>The old session file is replaced.</i>\n\nNo code arriving? Use QR login instead."), [[("🔳 Log in by QR (no code)", "sess:qr")], [("Cancel", "sess:x")]]
 
     @staticmethod
     def code_where(sent: Any, phone: str) -> tuple[str, list]:
@@ -3229,7 +3233,7 @@ class Hub:
             row.append(("📩 Resend by SMS", "sess:sms"))
         if nk == "Call":
             row.append(("📞 Call me", "sess:call"))
-        return text, ([row] if row else []) + [[("📜 Log", "sess:log"), ("Cancel", "sess:x")]]
+        return text, ([row] if row else []) + [[("🔳 Log in by QR (no code)", "sess:qr")], [("📜 Log", "sess:log"), ("Cancel", "sess:x")]]
 
     async def login_resend(self, uid: int, how: str) -> Reply:
         st = self.logins.get(uid)
@@ -3252,11 +3256,113 @@ class Hub:
             self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
 
+    async def login_client(self, uid: int, st: dict) -> bool:
+        """Connect the Telethon client of this login (new session file, through the proxies); False when no api id/hash is set."""
+        if st.get("client"):
+            return True
+        cr = PhoneChecker.creds()
+        if not cr:
+            await self.login_drop(uid)
+            return False
+        await CHECKER.close()                                            # it holds the old file open
+        for f in (SESSION_BASE + ".session", SESSION_BASE + ".session-journal"):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        from tgbot_checker import connect_client
+        st["client"] = await connect_client(SESSION_BASE, cr[0], cr[1], lambda m: self.login_note(uid, m), shuffle=True)
+        return True
+
+    async def login_finish(self, uid: int, st: dict) -> Reply:
+        me = await st["client"].get_me()
+        try:
+            st["client"].session.save()
+        except Exception:                                                # noqa: BLE001
+            pass
+        self.login_note(uid, "signed in, session saved")
+        for mid in st.get("qr_msgs", []):
+            try:
+                await self.bot.delete_message(uid, mid)                  # the QR is a login token: don't leave it in the chat
+            except Exception:                                            # noqa: BLE001
+                pass
+        await self.login_drop(uid)                                       # disconnect closes the session file
+        CHECKER.err, CHECKER.retry_at = "", 0.0
+        await CHECKER.close()                                            # reconnects with the new file on the next check
+        who = html.escape(me.first_name or "") + (f" (@{html.escape(me.username)})" if me.username else "")
+        return f"✅ Checker session created for <b>{who.strip()}</b>.", _nav()
+
+    async def login_qr(self, uid: int) -> Reply:
+        """Log in without a code: the admin scans a QR from a Telegram app already logged into the account (Settings > Devices > Link Desktop Device)."""
+        st = self.logins.get(uid)
+        if not st or st.get("stage") not in ("phone", "code"):
+            return "No login in progress. Send /session to start.", _nav()
+        self.login_arm(uid, st)
+        try:
+            import segno  # noqa: F401
+            if not await self.login_client(uid, st):
+                return "No Telegram api id/hash configured (SMSCENTER_TG_API_ID / SMSCENTER_TG_API_HASH).", _nav()
+            st["qr"] = await st["client"].qr_login()
+            st["stage"] = "qr"
+            self.login_note(uid, "QR login started")
+            st["qr_task"] = asyncio.create_task(self.login_qr_loop(uid, st))
+        except Exception as e:                                           # noqa: BLE001
+            await self.login_drop(uid)
+            self.login_note(uid, "QR start failed: " + type(e).__name__)
+            return f"❌ Could not start QR login: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
+        return ("🔳 <b>QR login</b>\nOn the phone where this account is logged in: Telegram → Settings → Devices → <b>Link Desktop Device</b> → scan the QR I send next. "
+                "It refreshes every ~30 s."), [[("📜 Log", "sess:log"), ("Cancel", "sess:x")]]
+
+    async def login_qr_loop(self, uid: int, st: dict) -> None:
+        import io
+        import segno
+        from aiogram.types import BufferedInputFile
+        from telethon.errors import SessionPasswordNeededError
+        st["qr_msgs"] = []
+        done: Reply | None = None
+        try:
+            while self.logins.get(uid) is st and st.get("stage") == "qr":
+                buf = io.BytesIO()
+                segno.make(st["qr"].url, error="m").save(buf, kind="png", scale=8, border=3)
+                m = await self.bot.send_photo(uid, BufferedInputFile(buf.getvalue(), "qr.png"), caption="Scan me: Settings → Devices → Link Desktop Device")
+                for old in st["qr_msgs"]:
+                    try:
+                        await self.bot.delete_message(uid, old)
+                    except Exception:                                    # noqa: BLE001
+                        pass
+                st["qr_msgs"] = [m.message_id]
+                try:
+                    await st["qr"].wait(30)
+                except asyncio.TimeoutError:
+                    await st["qr"].recreate()
+                    self.login_arm(uid, st)
+                    continue
+                except SessionPasswordNeededError:
+                    st["stage"] = "pw"
+                    self.login_note(uid, "QR scanned, 2-step password needed")
+                    self.app(uid).wipe_input = True
+                    await self.bot.send_message(uid, "🔒 QR accepted. This account has 2-step verification. Send its password. I delete your message right after.")
+                    return
+                self.login_note(uid, "QR scanned")
+                done = await self.login_finish(uid, st)
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                                           # noqa: BLE001
+            st.pop("qr_task", None)                                      # we are this task: don't cancel ourselves
+            self.login_note(uid, "QR login failed: " + type(e).__name__)
+            await self.login_drop(uid)
+            done = f"❌ QR login failed: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
+        if done:
+            await self.bot.send_message(uid, done[0], parse_mode="HTML", reply_markup=to_markup(done[1]))
+
     async def login_step(self, uid: int, text: str) -> Reply:
         st = self.logins[uid]
         self.app(uid).wipe_input = True                                  # phone, code and password must not stay in the chat
         self.login_arm(uid, st)
         cancel = [[("Cancel", "sess:x")]]
+        if st["stage"] == "qr":
+            return "🔳 Waiting for the QR scan - nothing to type. Scan the QR I sent, or Cancel.", cancel
         try:
             from telethon.errors import (ApiIdInvalidError, FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError,
                                          PhoneCodeInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
@@ -3269,18 +3375,8 @@ class Hub:
                 phone = "+" + re.sub(r"\D", "", text)
                 if len(phone) < 8:
                     return "That doesn't look like a phone number. Send it like <code>+15551234567</code>.", cancel
-                cr = PhoneChecker.creds()
-                if not cr:
-                    await self.login_drop(uid)
+                if not await self.login_client(uid, st):
                     return "No Telegram api id/hash configured (SMSCENTER_TG_API_ID / SMSCENTER_TG_API_HASH).", _nav()
-                await CHECKER.close()                                    # it holds the old file open
-                for f in (SESSION_BASE + ".session", SESSION_BASE + ".session-journal"):
-                    try:
-                        os.remove(f)
-                    except FileNotFoundError:
-                        pass
-                from tgbot_checker import connect_client
-                st["client"] = await connect_client(SESSION_BASE, cr[0], cr[1], lambda m: self.login_note(uid, m), shuffle=True)
                 sent = await st["client"].send_code_request(phone)
                 st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
                 self.login_note(uid, f"code requested: type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")
@@ -3299,17 +3395,7 @@ class Hub:
                     return "🔒 This account has 2-step verification. Send its password. I delete your message right after.", cancel
             else:
                 await st["client"].sign_in(password=text)
-            me = await st["client"].get_me()
-            try:
-                st["client"].session.save()
-            except Exception:                                            # noqa: BLE001
-                pass
-            self.login_note(uid, "signed in, session saved")
-            await self.login_drop(uid)                                   # disconnect closes the session file
-            CHECKER.err, CHECKER.retry_at = "", 0.0
-            await CHECKER.close()                                        # reconnects with the new file on the next check
-            who = html.escape(me.first_name or "") + (f" (@{html.escape(me.username)})" if me.username else "")
-            return f"✅ Checker session created for <b>{who.strip()}</b>.", _nav()
+            return await self.login_finish(uid, st)
         except PhoneCodeInvalidError:
             self.login_note(uid, "PhoneCodeInvalidError")
             return "❌ Wrong code. Type it again (with spaces), or Cancel.", cancel
