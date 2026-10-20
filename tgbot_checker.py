@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 from typing import Callable
 
@@ -28,12 +29,14 @@ def proxies() -> list[tuple]:
     return out
 
 
-async def connect_client(session, api_id: int, api_hash: str, note: Callable[[str], None] | None = None):
-    """A connected TelegramClient: through the first working proxy of SMSCENTER_TG_PROXIES (in order), or direct when none is set."""
+async def connect_client(session, api_id: int, api_hash: str, note: Callable[[str], None] | None = None, shuffle: bool = False):
+    """A connected TelegramClient: through the first working proxy of SMSCENTER_TG_PROXIES (in order, or in random order with shuffle), or direct when none is set."""
     from telethon import TelegramClient
-    tries = proxies() or [None]
+    tries = list(enumerate(proxies(), 1)) or [(0, None)]               # (its number in the list, proxy)
+    if shuffle:
+        random.shuffle(tries)
     last = None
-    for i, px in enumerate(tries, 1):
+    for i, px in tries:
         client = TelegramClient(session, api_id, api_hash, proxy=px) if px else TelegramClient(session, api_id, api_hash)
         try:
             await asyncio.wait_for(client.connect(), 20)
@@ -43,7 +46,7 @@ async def connect_client(session, api_id: int, api_hash: str, note: Callable[[st
         except Exception as e:                                           # noqa: BLE001
             last = e
             if note:
-                note(f"proxy #{i} failed: {type(e).__name__}")
+                note(f"proxy #{i} failed: {type(e).__name__}" if px else f"direct connect failed: {type(e).__name__}")
             try:
                 await client.disconnect()
             except Exception:                                            # noqa: BLE001

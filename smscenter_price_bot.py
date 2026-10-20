@@ -3280,7 +3280,7 @@ class Hub:
                     except FileNotFoundError:
                         pass
                 from tgbot_checker import connect_client
-                st["client"] = await connect_client(SESSION_BASE, cr[0], cr[1], lambda m: self.login_note(uid, m))
+                st["client"] = await connect_client(SESSION_BASE, cr[0], cr[1], lambda m: self.login_note(uid, m), shuffle=True)
                 sent = await st["client"].send_code_request(phone)
                 st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
                 self.login_note(uid, f"code requested: type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")
