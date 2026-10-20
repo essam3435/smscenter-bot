@@ -3249,7 +3249,6 @@ class Hub:
         self.login_arm(uid, st)
         cancel = [[("Cancel", "sess:x")]]
         try:
-            from telethon import TelegramClient
             from telethon.errors import (ApiIdInvalidError, FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError,
                                          PhoneCodeInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
                                          PhoneNumberInvalidError, SendCodeUnavailableError, SessionPasswordNeededError)
@@ -3271,8 +3270,8 @@ class Hub:
                         os.remove(f)
                     except FileNotFoundError:
                         pass
-                st["client"] = TelegramClient(SESSION_BASE, cr[0], cr[1])
-                await st["client"].connect()
+                from tgbot_checker import connect_client
+                st["client"] = await connect_client(SESSION_BASE, cr[0], cr[1], lambda m: self.login_note(uid, m))
                 sent = await st["client"].send_code_request(phone)
                 st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
                 self.login_note(uid, f"code requested: type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")

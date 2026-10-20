@@ -12,8 +12,44 @@ IMPORTANT: a Telethon session file must only be used by ONE running program at a
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from typing import Callable
+
+def proxies() -> list[tuple]:
+    """Telethon proxy tuples from SMSCENTER_TG_PROXIES: one 'host:port:user:pass' per line (or ';'-separated).
+    SMSCENTER_TG_PROXY_TYPE = socks5 (default) | http. Empty -> no proxy. Never log these."""
+    kind = os.environ.get("SMSCENTER_TG_PROXY_TYPE", "").strip().lower() or "socks5"
+    out = []
+    for raw in re.split(r"[;\r\n]+", os.environ.get("SMSCENTER_TG_PROXIES", "")):
+        p = raw.strip().split(":")
+        if len(p) >= 4 and p[1].isdigit():
+            out.append((kind, p[0], int(p[1]), True, p[2], ":".join(p[3:])))
+    return out
+
+
+async def connect_client(session, api_id: int, api_hash: str, note: Callable[[str], None] | None = None):
+    """A connected TelegramClient: through the first working proxy of SMSCENTER_TG_PROXIES (in order), or direct when none is set."""
+    from telethon import TelegramClient
+    tries = proxies() or [None]
+    last = None
+    for i, px in enumerate(tries, 1):
+        client = TelegramClient(session, api_id, api_hash, proxy=px) if px else TelegramClient(session, api_id, api_hash)
+        try:
+            await asyncio.wait_for(client.connect(), 20)
+            if note:
+                note(f"connected via proxy #{i}" if px else "connected directly (no proxy)")
+            return client
+        except Exception as e:                                           # noqa: BLE001
+            last = e
+            if note:
+                note(f"proxy #{i} failed: {type(e).__name__}")
+            try:
+                await client.disconnect()
+            except Exception:                                            # noqa: BLE001
+                pass
+    raise last if last else RuntimeError("no connection")
+
 
 BOT_DEFAULT = "tgchecker3bababot"
 MAX_PER_REQUEST = 8

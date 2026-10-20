@@ -42,6 +42,7 @@ jobs:
           SMSCENTER_TG_API_ID: ${{ secrets.TG_API_ID }}
           SMSCENTER_TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+          SMSCENTER_TG_PROXIES: ${{ secrets.TG_PROXIES }}
         run: |
           if [ ! -e gh_checker.session ] && [ -n "$TG_SESSION_B64" ]; then printf '%s' "$TG_SESSION_B64" | tr -d '\r\n ' | base64 -d > gh_checker.session; fi
           timeout --signal=INT --kill-after=60 330m python smscenter_price_bot.py || [ $? -eq 124 ]
