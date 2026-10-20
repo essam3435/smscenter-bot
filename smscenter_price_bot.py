@@ -497,6 +497,15 @@ class Store:
             json.dump(self.d, f, indent=1, ensure_ascii=False)
         os.replace(tmp, self.path)
 
+    # -- catch-all e-mail: the admin's profile holds the one domain / Gmail / app password; generated addresses live in each user's profile
+    def mail_cfg(self) -> tuple[str, str, str] | None:
+        m = (self.d["users"].get(str(self.d["admin"])) or {}).get("mail") or {}
+        return (m["gmail"], unseal(m.get("app_password", "")), m["domain"]) if (m.get("domain") and m.get("gmail") and m.get("app_password")) else None
+
+    def mail_owners(self) -> dict[str, int]:
+        """Every generated address -> the user it was made for."""
+        return {r["addr"].lower(): int(k) for k, u in self.d["users"].items() if k.lstrip("-").isdigit() for r in (u.get("mail") or {}).get("generated", [])}
+
 
 class UserState:
     """One user's view of the Store: .d is that user's profile (own SmsCenter key, tracks, intervals, alert settings)."""
@@ -1079,8 +1088,7 @@ class App:
         self.checker = CHECKER                                  # shared Telegram-checker (one Telethon session for the whole bot)
         self.hunts: dict[str, asyncio.Task] = {}                # hunter id -> running hunt loop
         self.code_tasks: dict[str, asyncio.Task] = {}           # bought number (idNum) -> waiting for its code
-        self.mail_task: asyncio.Task | None = None              # watches the catch-all Gmail for new mail
-        self.mail_err = ""
+        self.hub: Hub | None = None                             # set by the Hub: owns the one catch-all mail watcher
         self.wipe_input = False                                 # the message just typed holds a secret: delete it
 
     async def notify(self, text: str):
@@ -1154,9 +1162,6 @@ class App:
             t.cancel()
         self.hunts.clear()
         self.code_tasks.clear()
-        if self.mail_task:
-            self.mail_task.cancel()
-            self.mail_task = None
 
     # -- countries + platforms
     async def load_countries(self) -> list[dict]:
@@ -2255,38 +2260,14 @@ class App:
 
     # -- catch-all e-mail: your domain forwards everything to your Gmail; the bot makes believable addresses and hands you the codes that arrive
     def mail_cfg(self) -> tuple[str, str, str] | None:
-        m = self.s.mail
-        return (m["gmail"], unseal(m["app_password"]), m["domain"]) if (m["domain"] and m["gmail"] and m["app_password"]) else None
+        return self.s.store.mail_cfg()
+
+    def is_admin(self) -> bool:
+        return self.s.store.d["admin"] == self.uid
 
     def start_mail(self) -> None:
-        if self.mail_task is None or self.mail_task.done():
-            self.mail_task = asyncio.create_task(self.mail_loop())
-
-    async def mail_loop(self) -> None:
-        w = catchall.MailWatch()
-        try:
-            while True:
-                cfg = self.mail_cfg()
-                if not cfg:
-                    w.close()
-                    await asyncio.sleep(10)
-                    continue
-                delay = 6.0
-                try:
-                    for it in await asyncio.to_thread(w.poll, *cfg):
-                        await self.mail_notify(it)
-                    self.mail_err = ""
-                except Exception as e:                                   # noqa: BLE001
-                    w.close()
-                    delay = 30.0
-                    err = f"{type(e).__name__}: {str(e)[:100]}"
-                    log.warning("mail watcher: %s", err)
-                    if err != self.mail_err:
-                        self.mail_err = err
-                        await self.notify(f"⚠️ Email watcher can't read your Gmail ({html.escape(err)}). I keep retrying - check the App password in 📧 Email.")
-                await asyncio.sleep(delay)
-        finally:
-            w.close()
+        if self.hub:
+            self.hub.start_mail()
 
     def mail_rec(self, key: str, by: str = "id") -> dict | None:
         return next((r for r in self.s.mail["generated"] if r.get(by) == key), None)
@@ -2310,17 +2291,24 @@ class App:
     def email_menu(self, note: str = "") -> Reply:
         m = self.s.mail
         ok = lambda v: f"<code>{html.escape(v)}</code> ✅" if v else "not set ❗"                      # noqa: E731
-        txt = ("📧 <b>Catch-all email</b>\n"
-               f"🌐 Domain: {ok(m['domain'])}\n📮 Gmail: {ok(m['gmail'])}\n🔑 App password: {'set ✅' if m['app_password'] else 'not set ❗'}\n\n"
-               "Point your domain's <b>catch-all</b> at that Gmail. Then <b>Generate</b> gives you a real-looking address on your domain - "
-               "when a code or mail arrives for it, I send it here with a copy button.")
+        txt = "📧 <b>Catch-all email</b>\n"
+        if self.is_admin():
+            txt += (f"🌐 Domain: {ok(m['domain'])}\n📮 Gmail: {ok(m['gmail'])}\n🔑 App password: {'set ✅' if m['app_password'] else 'not set ❗'}\n\n"
+                    "Point your domain's <b>catch-all</b> at that Gmail. Then <b>Generate</b> gives everyone a real-looking address on your domain - ")
+        else:
+            txt += "<b>Generate</b> gives you a real-looking email address - "
+        txt += "when a code or mail arrives for it, I send it here with a copy button."
         if note:
             txt = note + "\n\n" + txt
         kb: KB = []
         if self.mail_cfg():
             kb.append([("✉️ Generate email", "em:g"), ("📋 My emails", "em:l")])
-        kb += [[("🌐 Domain", "em:s:d"), ("📮 Gmail", "em:s:g")], [("🔑 App password", "em:s:p")], [("🏠 Menu", "m")]]
-        return txt, kb
+        if self.is_admin():
+            kb += [[("🌐 Domain", "em:s:d"), ("📮 Gmail", "em:s:g")], [("🔑 App password", "em:s:p")]]
+        return txt, kb + [[("🏠 Menu", "m")]]
+
+    def mail_unset(self) -> Reply:
+        return self.email_menu("Set the domain, Gmail and App password first." if self.is_admin() else "The admin hasn't set up email yet.")
 
     def email_card(self, rec: dict, note: str = "") -> Reply:
         txt = f"✉️ <b>{html.escape(note or 'Your email')}</b>\n<code>{html.escape(rec['addr'])}</code>\n👤 {html.escape(rec['name'])}\n\n<i>Codes and mails sent to it show up here by themselves.</i>"
@@ -2332,6 +2320,9 @@ class App:
         if a == "m":
             return self.email_menu()
         if a == "s":
+            if not self.is_admin():
+                self.pending.pop(uid, None)
+                return self.email_menu("Only the admin can change this.")
             what = p[2] if len(p) > 2 else "d"
             field, prompt = {"d": ("emdomain", "🌐 Send your <b>domain</b> (e.g. <code>mydomain.com</code>)."),
                              "g": ("emgmail", "📮 Send the <b>Gmail address</b> your catch-all forwards to."),
@@ -2339,9 +2330,10 @@ class App:
             self.pending[uid] = (field, "", "")
             return prompt, [[("Cancel", "em:m")]]
         if a == "g":
-            if not self.mail_cfg():
-                return self.email_menu("Set the domain, Gmail and App password first.")
-            addr, name = catchall.generate(m["domain"], {r["addr"] for r in m["generated"]})
+            cfg = self.mail_cfg()
+            if not cfg:
+                return self.mail_unset()
+            addr, name = catchall.generate(cfg[2], set(self.s.store.mail_owners()))
             m["n"] += 1
             rec = {"id": str(m["n"]), "addr": addr, "name": name, "ts": time.time()}
             m["generated"] = (m["generated"] + [rec])[-60:]
@@ -2361,7 +2353,7 @@ class App:
         if a == "i":
             cfg = self.mail_cfg()
             if not cfg:
-                return self.email_menu("Set the domain, Gmail and App password first.")
+                return self.mail_unset()
             try:
                 mails = await catchall.inbox(cfg[0], cfg[1], rec["addr"])
             except Exception as e:                                       # noqa: BLE001
@@ -2381,6 +2373,9 @@ class App:
 
     async def take_email_value(self, field: str, text: str) -> Reply:
         m, v = self.s.mail, text.strip()
+        if not self.is_admin():
+            self.pending.pop(self.uid, None)
+            return self.email_menu("Only the admin can change this.")
         if field == "emdomain":
             v = re.sub(r"^(https?://)?(www\.)?|^@|/.*$", "", v.lower())
             if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", v):
@@ -2999,6 +2994,41 @@ class Hub:
         self.store, self.bot = store, bot
         self.apps: dict[int, App] = {}
         self.tasks: dict[int, asyncio.Task] = {}
+        self.mail_task: asyncio.Task | None = None              # the one watcher of the catch-all Gmail, for every user
+        self.mail_err = ""
+
+    def start_mail(self) -> None:
+        if self.mail_task is None or self.mail_task.done():
+            self.mail_task = asyncio.create_task(self.mail_loop())
+
+    async def mail_loop(self) -> None:
+        w = catchall.MailWatch()
+        try:
+            while True:
+                cfg = self.store.mail_cfg()
+                if not cfg:
+                    w.close()
+                    await asyncio.sleep(10)
+                    continue
+                delay = 6.0
+                try:
+                    owners = self.store.mail_owners()
+                    for it in await asyncio.to_thread(w.poll, cfg[0], cfg[1], frozenset(owners)):
+                        uid = owners.get(it["to"])
+                        if uid is not None and self.allowed(uid):
+                            await self.app(uid).mail_notify(it)
+                    self.mail_err = ""
+                except Exception as e:                                   # noqa: BLE001
+                    w.close()
+                    delay = 30.0
+                    err = f"{type(e).__name__}: {str(e)[:100]}"
+                    log.warning("mail watcher: %s", err)
+                    if err != self.mail_err:
+                        self.mail_err = err
+                        await self.app(self.store.d["admin"]).notify(f"⚠️ Email watcher can't read your Gmail ({html.escape(err)}). I keep retrying - check the App password in 📧 Email.")
+                await asyncio.sleep(delay)
+        finally:
+            w.close()
 
     def allowed(self, uid: int) -> bool:
         d = self.store.d
@@ -3009,6 +3039,7 @@ class Hub:
     def app(self, uid: int) -> App:
         if uid not in self.apps:
             a = self.apps[uid] = App(UserState(self.store, uid), self.bot, uid)
+            a.hub = self
             self.tasks[uid] = asyncio.create_task(a.tracker.run())
             a.resume_watchers()
             asyncio.create_task(a.warm())
@@ -3037,6 +3068,9 @@ class Hub:
     def shutdown(self) -> None:
         for uid in list(self.tasks):
             self.stop(uid)
+        if self.mail_task:
+            self.mail_task.cancel()
+            self.mail_task = None
 
     async def handle(self, uid: int, text: str) -> Reply | None:
         d = self.store.d
