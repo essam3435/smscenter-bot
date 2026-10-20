@@ -3031,6 +3031,7 @@ class Hub:
         self.store, self.bot = store, bot
         self.apps: dict[int, App] = {}
         self.tasks: dict[int, asyncio.Task] = {}
+        self.login_logs: dict[int, list[str]] = {}                       # admin uid -> last login events (class names/types only, never secrets)
         self.logins: dict[int, dict] = {}                                # admin uid -> half-finished Telethon login {client, phone, hash, stage, timer}
         self.mail_task: asyncio.Task | None = None              # the one watcher of the catch-all Gmail, for every user
         self.mail_err = ""
@@ -3141,12 +3142,24 @@ class Hub:
             if data == "sess:x":
                 await self.login_drop(uid)
                 return "Cancelled.", _nav()
+            if data == "sess:log":
+                return self.login_log(uid), [[("📜 Refresh", "sess:log"), ("Cancel", "sess:x")]]
             if data in ("sess:sms", "sess:call"):
                 return await self.login_resend(uid, data[5:])
             return await self.login_start(uid)
         return await self.app(uid).ui(uid, data)
 
     # -- new Telethon session for the number checker, created from the admin's chat (nothing secret goes through workflow inputs or logs)
+    def login_note(self, uid: int, msg: str) -> None:
+        """Record a login event for the admin's 📜 Log button and the Actions log (never put phone/code/hash/exception text in msg)."""
+        buf = self.login_logs.setdefault(uid, [])
+        buf.append(time.strftime("%H:%M:%S", time.gmtime()) + " " + msg)
+        del buf[:-25]
+        log.info("session login: %s", msg)
+
+    def login_log(self, uid: int) -> str:
+        return "📜 <b>Login log</b> (UTC)\n" + ("\n".join(html.escape(x) for x in self.login_logs.get(uid, [])) or "nothing yet - send /session")
+
     async def login_drop(self, uid: int) -> None:
         st = self.logins.pop(uid, None)
         if st:
@@ -3174,6 +3187,8 @@ class Hub:
 
     async def login_start(self, uid: int) -> Reply:
         await self.login_drop(uid)
+        self.login_logs[uid] = []
+        self.login_note(uid, "login started")
         st = self.logins[uid] = {"client": None, "phone": "", "hash": "", "stage": "phone", "timer": None}
         self.login_arm(uid, st)
         self.app(uid).wipe_input = False
@@ -3205,7 +3220,7 @@ class Hub:
             row.append(("📩 Resend by SMS", "sess:sms"))
         if nk == "Call":
             row.append(("📞 Call me", "sess:call"))
-        return text, ([row] if row else []) + [[("Cancel", "sess:x")]]
+        return text, ([row] if row else []) + [[("📜 Log", "sess:log"), ("Cancel", "sess:x")]]
 
     async def login_resend(self, uid: int, how: str) -> Reply:
         st = self.logins.get(uid)
@@ -3217,13 +3232,15 @@ class Hub:
             from telethon.tl.functions.auth import ResendCodeRequest
             sent = await st["client"](ResendCodeRequest(st["phone"], st["hash"]))
             st["hash"] = sent.phone_code_hash
+            self.login_note(uid, f"resend ({how}): type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")
             text, kb = self.code_where(sent, st["phone"])
             return text + "\nType it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code>.", kb
         except FloodWaitError as e:
+            self.login_note(uid, f"FloodWaitError {e.seconds}s")
             return f"⏳ Telegram says wait {e.seconds} seconds before asking for another code.", [[("Cancel", "sess:x")]]
         except Exception as e:                                           # noqa: BLE001
             await self.login_drop(uid)
-            log.warning("session code resend failed: %s", type(e).__name__)
+            self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
 
     async def login_step(self, uid: int, text: str) -> Reply:
@@ -3258,6 +3275,7 @@ class Hub:
                 await st["client"].connect()
                 sent = await st["client"].send_code_request(phone)
                 st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
+                self.login_note(uid, f"code requested: type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")
                 where, kb = self.code_where(sent, phone)
                 return (where + "\nType it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code> - "
                         "Telegram cancels codes that are sent to it as plain digits. I delete your message right after."), kb
@@ -3265,6 +3283,7 @@ class Hub:
                 code = re.sub(r"\D", "", text)
                 if not code:
                     return "Send the code you received, digits with spaces or dashes (<code>1 2 3 4 5</code>).", cancel
+                self.login_note(uid, f"code entered ({len(code)} digits)")
                 try:
                     await st["client"].sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
                 except SessionPasswordNeededError:
@@ -3277,39 +3296,49 @@ class Hub:
                 st["client"].session.save()
             except Exception:                                            # noqa: BLE001
                 pass
+            self.login_note(uid, "signed in, session saved")
             await self.login_drop(uid)                                   # disconnect closes the session file
             CHECKER.err, CHECKER.retry_at = "", 0.0
             await CHECKER.close()                                        # reconnects with the new file on the next check
             who = html.escape(me.first_name or "") + (f" (@{html.escape(me.username)})" if me.username else "")
             return f"✅ Checker session created for <b>{who.strip()}</b>.", _nav()
         except PhoneCodeInvalidError:
+            self.login_note(uid, "PhoneCodeInvalidError")
             return "❌ Wrong code. Type it again (with spaces), or Cancel.", cancel
         except PhoneCodeExpiredError:
+            self.login_note(uid, "PhoneCodeExpiredError")
             await self.login_drop(uid)
             return "⌛ That code expired. Send /session to start again.", _nav()
         except PasswordHashInvalidError:
+            self.login_note(uid, "PasswordHashInvalidError")
             return "❌ Wrong password. Send it again, or Cancel.", cancel
         except FloodWaitError as e:
+            self.login_note(uid, f"FloodWaitError {e.seconds}s")
             await self.login_drop(uid)
             return f"⏳ Telegram says wait {e.seconds} seconds before trying again.", _nav()
         except PhoneNumberInvalidError:
+            self.login_note(uid, "PhoneNumberInvalidError")
             await self.login_drop(uid)
             return "❌ Telegram says that phone number is invalid. Send /session to try again.", _nav()
         except SendCodeUnavailableError:
+            self.login_note(uid, "SendCodeUnavailableError")
             await self.login_drop(uid)
             return "❌ Telegram has no way left to send a code to this number right now (all methods used or blocked). Wait a while, then send /session.", _nav()
         except PhoneNumberBannedError:
+            self.login_note(uid, "PhoneNumberBannedError")
             await self.login_drop(uid)
             return "❌ Telegram says this phone number is banned.", _nav()
         except PhoneNumberFloodError:
+            self.login_note(uid, "PhoneNumberFloodError")
             await self.login_drop(uid)
             return "❌ Telegram says this number asked for too many codes. Try again much later.", _nav()
         except ApiIdInvalidError:
+            self.login_note(uid, "ApiIdInvalidError")
             await self.login_drop(uid)
             return "❌ The Telegram api id/hash is invalid (SMSCENTER_TG_API_ID / SMSCENTER_TG_API_HASH).", _nav()
         except Exception as e:                                           # noqa: BLE001  (never put e's text in the reply/log: it could echo input)
             await self.login_drop(uid)
-            log.warning("session login failed: %s", type(e).__name__)
+            self.login_note(uid, "login failed: " + type(e).__name__)
             return f"❌ Login failed: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
 
     async def admin(self, cmd: str, arg: str) -> Reply:
