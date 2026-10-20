@@ -26,7 +26,7 @@ Run:   python scripts/smscenter_price_bot.py
   First time it asks for the bot token (from @BotFather). Open the bot and send /start: the first person to do that becomes
   the ADMIN. MANY USERS can use the bot: every user has their own profile (own SmsCenter key via  /setkey <key>, own tracks,
   own intervals and alerts) and alerts are sent to them privately. The admin can close the bot to everyone else:
-  /access open|closed · /allow <id> · /deny <id> · /users
+  /access open|closed · /allow <id> · /deny <id> · /users  · /session (new checker Telethon session)
 
 How you use it (all buttons):
   1. 📱 Platforms  -> pick a platform (e.g. Telegram)
@@ -76,6 +76,21 @@ if HERE_DIR not in sys.path:
 import catchall  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _admin_id() -> int | None:
+    """Admin Telegram id: SMSCENTER_ADMIN_ID if set and numeric, else admin_id from config.json next to the script."""
+    env = os.environ.get("SMSCENTER_ADMIN_ID", "").strip()
+    if env.isdigit():
+        return int(env)
+    try:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+            v = json.load(f).get("admin_id")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
 STATE_PATH = os.environ.get("SMSCENTER_BOT_STATE") or os.path.join(HERE, ".smscenter_bot.json")
 BASE_URL = "https://smscenter.pro/api"
 DEFAULT_SVC = "tg"
@@ -113,6 +128,19 @@ DEFAULT_SERVICES = {
     "vk": "VKontakte", "ok": "Odnoklassniki", "me": "Line", "am": "Amazon", "ni": "Gojek", "ka": "Shopee", "ot": "Any other",
 }
 log = logging.getLogger("smscenter_bot")
+_SECRET_RE = re.compile(r"(?i)((?:api_?key|token)=)[^&\s'\"]+|(/bot\d+:)[\w-]+")
+
+
+def redact(s: Any) -> str:
+    """Strip API keys / tokens out of anything that is logged or sent to Telegram (URLs with ?apiKey=..., /bot<token>/...)."""
+    return _SECRET_RE.sub(lambda m: (m.group(1) or m.group(2)) + "***", str(s))
+
+
+class RedactFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
 KB = list[list[tuple[str, str]]]
 Reply = tuple[str, "KB | None"]
 
@@ -475,6 +503,12 @@ class Store:
                 self.d["users"].setdefault(str(owner), legacy)
             else:
                 self.d["legacy"] = legacy
+        admin = _admin_id()
+        if admin:                                                        # the configured admin always wins over the saved one
+            self.d["admin"] = admin
+            if self.d.get("legacy"):
+                self.d["users"].setdefault(str(admin), self.d.pop("legacy"))
+                self.d["legacy"] = None
         for prof in self.d["users"].values():
             normalize(prof)
         if self.d.get("legacy"):
@@ -496,6 +530,15 @@ class Store:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.d, f, indent=1, ensure_ascii=False)
         os.replace(tmp, self.path)
+
+    # -- catch-all e-mail: the admin's profile holds the one domain / Gmail / app password; generated addresses live in each user's profile
+    def mail_cfg(self) -> tuple[str, str, str] | None:
+        m = (self.d["users"].get(str(self.d["admin"])) or {}).get("mail") or {}
+        return (m["gmail"], unseal(m.get("app_password", "")), m["domain"]) if (m.get("domain") and m.get("gmail") and m.get("app_password")) else None
+
+    def mail_owners(self) -> dict[str, int]:
+        """Every generated address -> the user it was made for."""
+        return {r["addr"].lower(): int(k) for k, u in self.d["users"].items() if k.lstrip("-").isdigit() for r in (u.get("mail") or {}).get("generated", [])}
 
 
 class UserState:
@@ -569,7 +612,7 @@ class SmsCenter:
             r = await self.http.get(BASE_URL + path, params=q)
             data = r.json()
         except httpx.HTTPError as e:
-            raise SmsCenterError(f"network error: {e}") from e
+            raise SmsCenterError(f"network error: {redact(e)}") from e
         except ValueError:
             raise SmsCenterError(f"bad response (HTTP {r.status_code})")
         if isinstance(data, dict) and data.get("error"):
@@ -628,7 +671,7 @@ class SmsCenter:
         try:
             r = await self.http.get(V0_URL, params={"api_key": self.api_key, "action": "getStatus", "id": id_num})
         except httpx.HTTPError as e:
-            raise SmsCenterError(f"network error: {e}") from e
+            raise SmsCenterError(f"network error: {redact(e)}") from e
         t = r.text.strip()
         if t.startswith("STATUS_OK"):
             return "ok", (t.split(":", 1)[1].strip() if ":" in t else None) or None
@@ -1079,8 +1122,7 @@ class App:
         self.checker = CHECKER                                  # shared Telegram-checker (one Telethon session for the whole bot)
         self.hunts: dict[str, asyncio.Task] = {}                # hunter id -> running hunt loop
         self.code_tasks: dict[str, asyncio.Task] = {}           # bought number (idNum) -> waiting for its code
-        self.mail_task: asyncio.Task | None = None              # watches the catch-all Gmail for new mail
-        self.mail_err = ""
+        self.hub: Hub | None = None                             # set by the Hub: owns the one catch-all mail watcher
         self.wipe_input = False                                 # the message just typed holds a secret: delete it
 
     async def notify(self, text: str):
@@ -1154,9 +1196,6 @@ class App:
             t.cancel()
         self.hunts.clear()
         self.code_tasks.clear()
-        if self.mail_task:
-            self.mail_task.cancel()
-            self.mail_task = None
 
     # -- countries + platforms
     async def load_countries(self) -> list[dict]:
@@ -1415,6 +1454,7 @@ class App:
               [(("✅ " if e in self.s.endpoints else "▫️ ") + ENDPOINTS[e], f"s:e:{e}") for e in ("offer", "list")],
               [(("✅ " if "count" in self.s.endpoints else "▫️ ") + ENDPOINTS["count"], "s:e:count")],
               [("🔕 30m", "s:mute:30"), ("🔕 2h", "s:mute:120"), ("🔔 unmute", "s:mute:0")],
+              *([[("🔐 Checker session", "sess:go")]] if self.s.store.d["admin"] == self.uid else []),
               [("🏠 Menu", "m")]]
         return ("⚙️ <b>Settings</b>\nRow 1-2: DEFAULT check interval (a track can override it in its control center) · Row 3: default drop % · "
                 "then which of the 3 endpoints to watch · mute everything.\n"
@@ -2255,38 +2295,14 @@ class App:
 
     # -- catch-all e-mail: your domain forwards everything to your Gmail; the bot makes believable addresses and hands you the codes that arrive
     def mail_cfg(self) -> tuple[str, str, str] | None:
-        m = self.s.mail
-        return (m["gmail"], unseal(m["app_password"]), m["domain"]) if (m["domain"] and m["gmail"] and m["app_password"]) else None
+        return self.s.store.mail_cfg()
+
+    def is_admin(self) -> bool:
+        return self.s.store.d["admin"] == self.uid
 
     def start_mail(self) -> None:
-        if self.mail_task is None or self.mail_task.done():
-            self.mail_task = asyncio.create_task(self.mail_loop())
-
-    async def mail_loop(self) -> None:
-        w = catchall.MailWatch()
-        try:
-            while True:
-                cfg = self.mail_cfg()
-                if not cfg:
-                    w.close()
-                    await asyncio.sleep(10)
-                    continue
-                delay = 6.0
-                try:
-                    for it in await asyncio.to_thread(w.poll, *cfg):
-                        await self.mail_notify(it)
-                    self.mail_err = ""
-                except Exception as e:                                   # noqa: BLE001
-                    w.close()
-                    delay = 30.0
-                    err = f"{type(e).__name__}: {str(e)[:100]}"
-                    log.warning("mail watcher: %s", err)
-                    if err != self.mail_err:
-                        self.mail_err = err
-                        await self.notify(f"⚠️ Email watcher can't read your Gmail ({html.escape(err)}). I keep retrying - check the App password in 📧 Email.")
-                await asyncio.sleep(delay)
-        finally:
-            w.close()
+        if self.hub:
+            self.hub.start_mail()
 
     def mail_rec(self, key: str, by: str = "id") -> dict | None:
         return next((r for r in self.s.mail["generated"] if r.get(by) == key), None)
@@ -2310,17 +2326,24 @@ class App:
     def email_menu(self, note: str = "") -> Reply:
         m = self.s.mail
         ok = lambda v: f"<code>{html.escape(v)}</code> ✅" if v else "not set ❗"                      # noqa: E731
-        txt = ("📧 <b>Catch-all email</b>\n"
-               f"🌐 Domain: {ok(m['domain'])}\n📮 Gmail: {ok(m['gmail'])}\n🔑 App password: {'set ✅' if m['app_password'] else 'not set ❗'}\n\n"
-               "Point your domain's <b>catch-all</b> at that Gmail. Then <b>Generate</b> gives you a real-looking address on your domain - "
-               "when a code or mail arrives for it, I send it here with a copy button.")
+        txt = "📧 <b>Catch-all email</b>\n"
+        if self.is_admin():
+            txt += (f"🌐 Domain: {ok(m['domain'])}\n📮 Gmail: {ok(m['gmail'])}\n🔑 App password: {'set ✅' if m['app_password'] else 'not set ❗'}\n\n"
+                    "Point your domain's <b>catch-all</b> at that Gmail. Then <b>Generate</b> gives everyone a real-looking address on your domain - ")
+        else:
+            txt += "<b>Generate</b> gives you a real-looking email address - "
+        txt += "when a code or mail arrives for it, I send it here with a copy button."
         if note:
             txt = note + "\n\n" + txt
         kb: KB = []
         if self.mail_cfg():
             kb.append([("✉️ Generate email", "em:g"), ("📋 My emails", "em:l")])
-        kb += [[("🌐 Domain", "em:s:d"), ("📮 Gmail", "em:s:g")], [("🔑 App password", "em:s:p")], [("🏠 Menu", "m")]]
-        return txt, kb
+        if self.is_admin():
+            kb += [[("🌐 Domain", "em:s:d"), ("📮 Gmail", "em:s:g")], [("🔑 App password", "em:s:p")]]
+        return txt, kb + [[("🏠 Menu", "m")]]
+
+    def mail_unset(self) -> Reply:
+        return self.email_menu("Set the domain, Gmail and App password first." if self.is_admin() else "The admin hasn't set up email yet.")
 
     def email_card(self, rec: dict, note: str = "") -> Reply:
         txt = f"✉️ <b>{html.escape(note or 'Your email')}</b>\n<code>{html.escape(rec['addr'])}</code>\n👤 {html.escape(rec['name'])}\n\n<i>Codes and mails sent to it show up here by themselves.</i>"
@@ -2332,6 +2355,9 @@ class App:
         if a == "m":
             return self.email_menu()
         if a == "s":
+            if not self.is_admin():
+                self.pending.pop(uid, None)
+                return self.email_menu("Only the admin can change this.")
             what = p[2] if len(p) > 2 else "d"
             field, prompt = {"d": ("emdomain", "🌐 Send your <b>domain</b> (e.g. <code>mydomain.com</code>)."),
                              "g": ("emgmail", "📮 Send the <b>Gmail address</b> your catch-all forwards to."),
@@ -2339,9 +2365,10 @@ class App:
             self.pending[uid] = (field, "", "")
             return prompt, [[("Cancel", "em:m")]]
         if a == "g":
-            if not self.mail_cfg():
-                return self.email_menu("Set the domain, Gmail and App password first.")
-            addr, name = catchall.generate(m["domain"], {r["addr"] for r in m["generated"]})
+            cfg = self.mail_cfg()
+            if not cfg:
+                return self.mail_unset()
+            addr, name = catchall.generate(cfg[2], set(self.s.store.mail_owners()))
             m["n"] += 1
             rec = {"id": str(m["n"]), "addr": addr, "name": name, "ts": time.time()}
             m["generated"] = (m["generated"] + [rec])[-60:]
@@ -2361,7 +2388,7 @@ class App:
         if a == "i":
             cfg = self.mail_cfg()
             if not cfg:
-                return self.email_menu("Set the domain, Gmail and App password first.")
+                return self.mail_unset()
             try:
                 mails = await catchall.inbox(cfg[0], cfg[1], rec["addr"])
             except Exception as e:                                       # noqa: BLE001
@@ -2381,6 +2408,9 @@ class App:
 
     async def take_email_value(self, field: str, text: str) -> Reply:
         m, v = self.s.mail, text.strip()
+        if not self.is_admin():
+            self.pending.pop(self.uid, None)
+            return self.email_menu("Only the admin can change this.")
         if field == "emdomain":
             v = re.sub(r"^(https?://)?(www\.)?|^@|/.*$", "", v.lower())
             if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", v):
@@ -2989,7 +3019,9 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session"}
+LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
+SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
 
 class Hub:
@@ -2999,6 +3031,42 @@ class Hub:
         self.store, self.bot = store, bot
         self.apps: dict[int, App] = {}
         self.tasks: dict[int, asyncio.Task] = {}
+        self.logins: dict[int, dict] = {}                                # admin uid -> half-finished Telethon login {client, phone, hash, stage, timer}
+        self.mail_task: asyncio.Task | None = None              # the one watcher of the catch-all Gmail, for every user
+        self.mail_err = ""
+
+    def start_mail(self) -> None:
+        if self.mail_task is None or self.mail_task.done():
+            self.mail_task = asyncio.create_task(self.mail_loop())
+
+    async def mail_loop(self) -> None:
+        w = catchall.MailWatch()
+        try:
+            while True:
+                cfg = self.store.mail_cfg()
+                if not cfg:
+                    w.close()
+                    await asyncio.sleep(10)
+                    continue
+                delay = 6.0
+                try:
+                    owners = self.store.mail_owners()
+                    for it in await asyncio.to_thread(w.poll, cfg[0], cfg[1], frozenset(owners)):
+                        uid = owners.get(it["to"])
+                        if uid is not None and self.allowed(uid):
+                            await self.app(uid).mail_notify(it)
+                    self.mail_err = ""
+                except Exception as e:                                   # noqa: BLE001
+                    w.close()
+                    delay = 30.0
+                    err = f"{type(e).__name__}: {str(e)[:100]}"
+                    log.warning("mail watcher: %s", err)
+                    if err != self.mail_err:
+                        self.mail_err = err
+                        await self.app(self.store.d["admin"]).notify(f"⚠️ Email watcher can't read your Gmail ({html.escape(err)}). I keep retrying - check the App password in 📧 Email.")
+                await asyncio.sleep(delay)
+        finally:
+            w.close()
 
     def allowed(self, uid: int) -> bool:
         d = self.store.d
@@ -3009,6 +3077,7 @@ class Hub:
     def app(self, uid: int) -> App:
         if uid not in self.apps:
             a = self.apps[uid] = App(UserState(self.store, uid), self.bot, uid)
+            a.hub = self
             self.tasks[uid] = asyncio.create_task(a.tracker.run())
             a.resume_watchers()
             asyncio.create_task(a.warm())
@@ -3037,6 +3106,9 @@ class Hub:
     def shutdown(self) -> None:
         for uid in list(self.tasks):
             self.stop(uid)
+        if self.mail_task:
+            self.mail_task.cancel()
+            self.mail_task = None
 
     async def handle(self, uid: int, text: str) -> Reply | None:
         d = self.store.d
@@ -3052,14 +3124,131 @@ class Hub:
             return ("👑 You are the <b>admin</b> of this bot (/users · /access · /allow · /deny).\n\n" + res[0], res[1]) if res else res
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
+        if cmd == "/session" and uid != d["admin"]:
+            return "Only the admin can do that.", None
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
+        if uid == d["admin"] and uid in self.logins and not cmd.startswith("/"):
+            return await self.login_step(uid, text)
         return await self.app(uid).handle(uid, text)
 
     async def ui(self, uid: int, data: str) -> Reply | None:
         if not self.allowed(uid):
             return None
+        if data.startswith("sess:"):
+            if uid != self.store.d["admin"]:
+                return None
+            if data == "sess:x":
+                await self.login_drop(uid)
+                return "Cancelled.", _nav()
+            return await self.login_start(uid)
         return await self.app(uid).ui(uid, data)
+
+    # -- new Telethon session for the number checker, created from the admin's chat (nothing secret goes through workflow inputs or logs)
+    async def login_drop(self, uid: int) -> None:
+        st = self.logins.pop(uid, None)
+        if st:
+            if st.get("timer"):
+                st["timer"].cancel()
+            if st.get("client"):
+                try:
+                    await st["client"].disconnect()
+                except Exception:                                        # noqa: BLE001
+                    pass
+
+    def login_arm(self, uid: int, st: dict) -> None:
+        if st.get("timer"):
+            st["timer"].cancel()
+        st["timer"] = asyncio.get_running_loop().call_later(LOGIN_TTL, lambda: asyncio.create_task(self.login_expire(uid, st)))
+
+    async def login_expire(self, uid: int, st: dict) -> None:
+        if self.logins.get(uid) is not st:
+            return
+        await self.login_drop(uid)
+        try:
+            await self.bot.send_message(uid, "⏱ The Telegram login timed out (5 min). Send /session to start again.")
+        except Exception:                                                # noqa: BLE001
+            pass
+
+    async def login_start(self, uid: int) -> Reply:
+        await self.login_drop(uid)
+        st = self.logins[uid] = {"client": None, "phone": "", "hash": "", "stage": "phone", "timer": None}
+        self.login_arm(uid, st)
+        self.app(uid).wipe_input = False
+        return ("🔐 <b>New checker session</b>\nSend the phone number of the Telegram account the checker should use, in international format (<code>+15551234567</code>). "
+                "I delete your message right after.\n<i>The old session file is replaced.</i>"), [[("Cancel", "sess:x")]]
+
+    async def login_step(self, uid: int, text: str) -> Reply:
+        st = self.logins[uid]
+        self.app(uid).wipe_input = True                                  # phone, code and password must not stay in the chat
+        self.login_arm(uid, st)
+        cancel = [[("Cancel", "sess:x")]]
+        try:
+            from telethon import TelegramClient
+            from telethon.errors import (FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError, PhoneCodeInvalidError,
+                                         PhoneNumberInvalidError, SessionPasswordNeededError)
+        except ImportError:
+            await self.login_drop(uid)
+            return "Telethon is not installed on this bot.", _nav()
+        try:
+            if st["stage"] == "phone":
+                phone = "+" + re.sub(r"\D", "", text)
+                if len(phone) < 8:
+                    return "That doesn't look like a phone number. Send it like <code>+15551234567</code>.", cancel
+                cr = PhoneChecker.creds()
+                if not cr:
+                    await self.login_drop(uid)
+                    return "No Telegram api id/hash configured (SMSCENTER_TG_API_ID / SMSCENTER_TG_API_HASH).", _nav()
+                await CHECKER.close()                                    # it holds the old file open
+                for f in (SESSION_BASE + ".session", SESSION_BASE + ".session-journal"):
+                    try:
+                        os.remove(f)
+                    except FileNotFoundError:
+                        pass
+                st["client"] = TelegramClient(SESSION_BASE, cr[0], cr[1])
+                await st["client"].connect()
+                sent = await st["client"].send_code_request(phone)
+                st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
+                return ("📨 Telegram sent you a login code. Type it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code> - "
+                        "Telegram cancels codes that are sent to it as plain digits. I delete your message right after."), cancel
+            if st["stage"] == "code":
+                code = re.sub(r"\D", "", text)
+                if not code:
+                    return "Send the code you received, digits with spaces or dashes (<code>1 2 3 4 5</code>).", cancel
+                try:
+                    await st["client"].sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
+                except SessionPasswordNeededError:
+                    st["stage"] = "pw"
+                    return "🔒 This account has 2-step verification. Send its password. I delete your message right after.", cancel
+            else:
+                await st["client"].sign_in(password=text)
+            me = await st["client"].get_me()
+            try:
+                st["client"].session.save()
+            except Exception:                                            # noqa: BLE001
+                pass
+            await self.login_drop(uid)                                   # disconnect closes the session file
+            CHECKER.err, CHECKER.retry_at = "", 0.0
+            await CHECKER.close()                                        # reconnects with the new file on the next check
+            who = html.escape(me.first_name or "") + (f" (@{html.escape(me.username)})" if me.username else "")
+            return f"✅ Checker session created for <b>{who.strip()}</b>.", _nav()
+        except PhoneCodeInvalidError:
+            return "❌ Wrong code. Type it again (with spaces), or Cancel.", cancel
+        except PhoneCodeExpiredError:
+            await self.login_drop(uid)
+            return "⌛ That code expired. Send /session to start again.", _nav()
+        except PasswordHashInvalidError:
+            return "❌ Wrong password. Send it again, or Cancel.", cancel
+        except FloodWaitError as e:
+            await self.login_drop(uid)
+            return f"⏳ Telegram says wait {e.seconds} seconds before trying again.", _nav()
+        except PhoneNumberInvalidError:
+            await self.login_drop(uid)
+            return "❌ Telegram says that phone number is invalid. Send /session to try again.", _nav()
+        except Exception as e:                                           # noqa: BLE001  (never put e's text in the reply/log: it could echo input)
+            await self.login_drop(uid)
+            log.warning("session login failed: %s", type(e).__name__)
+            return f"❌ Login failed: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
 
     async def admin(self, cmd: str, arg: str) -> Reply:
         d = self.store.d
@@ -3089,6 +3278,8 @@ class Hub:
                 self.sync()
             self.store.save()
             return (f"{uid} allowed." if cmd == "/allow" else f"{uid} blocked."), _nav()
+        if cmd == "/session":
+            return await self.login_start(d["admin"])
         lines = [f"Access: {d['access']}", f"Allowed IDs: {', '.join(map(str, d['allowed'])) or '-'}", f"Blocked IDs: {', '.join(map(str, d['blocked'])) or '-'}", ""]
         for k, prof in d["users"].items():
             n = sum(1 for t in prof.get("tracks", {}).values() if t.get("on"))
@@ -3195,9 +3386,14 @@ async def setup(st: Store, force: bool = False) -> bool:
 
 async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    for h in logging.getLogger().handlers:
+        h.setFormatter(RedactFormatter(h.formatter._fmt if h.formatter else None))
+    for n in ("httpx", "httpcore"):                      # their INFO lines carry full request URLs, key included
+        logging.getLogger(n).setLevel(logging.WARNING)
     from aiogram import Bot, Dispatcher, F
     from aiogram.types import BotCommand, CallbackQuery, Message
 
+    existed = os.path.exists(STATE_PATH)
     st = Store(STATE_PATH)
     if not await setup(st, force="--setup" in sys.argv):
         return 1
@@ -3238,6 +3434,13 @@ async def main() -> int:
 
     await bot.set_my_commands([BotCommand(command="menu", description="Main menu")])                # the only command in the Telegram menu: everything else is buttons
     print(f"Running as @{me.username}. " + ("Admin is set." if st.d["admin"] else "Open the bot and send /start to become the admin."))
+    try:
+        profs = [*st.d["users"].values(), *([st.d["legacy"]] if st.d.get("legacy") else [])]
+        n_hunters = sum(len(p.get("hunters") or {}) for p in profs)
+        run_id = os.environ.get("GITHUB_RUN_ID")
+        await bot.send_message(st.d["admin"], f"Bot started. state.json {'loaded' if existed else '<b>not found</b> (fresh state)'}, hunters: <b>{n_hunters}</b>" + (f", run <code>{run_id}</code>" if run_id else ""), parse_mode="HTML")
+    except Exception as e:                                                # noqa: BLE001
+        log.warning("start notice failed: %s", e)
     hub.start_saved()                                                     # everybody's saved tracking resumes
     try:
         await dp.start_polling(bot)

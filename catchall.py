@@ -146,7 +146,7 @@ ADDR_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", re.I)
 
 
 class MailWatch:
-    """Keeps one IMAP connection to the Gmail and reports each NEW message that was sent to an address on your domain (the first poll only marks 'now')."""
+    """Keeps one IMAP connection to the Gmail and reports each NEW message sent to one of the generated addresses (the first poll only marks 'now'; all other mail is skipped)."""
 
     def __init__(self):
         self.m: imaplib.IMAP4_SSL | None = None
@@ -161,7 +161,7 @@ class MailWatch:
                 pass
         self.m, self.cfg, self.last = None, None, None
 
-    def poll(self, gmail: str, password: str, domain: str) -> list[dict]:
+    def poll(self, gmail: str, password: str, known: frozenset[str]) -> list[dict]:
         if self.m is None or self.cfg != (gmail, password):
             self.close()
             m = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=25)
@@ -184,7 +184,7 @@ class MailWatch:
                 continue
             msg = email.message_from_bytes(parts[0][1])
             heads = " ".join(_dec(msg.get(h)) for h in ("To", "Cc", "Delivered-To", "X-Original-To", "X-Forwarded-To"))
-            hit = next((a.lower() for a in ADDR_RE.findall(heads) if a.lower().endswith("@" + domain.lower())), None)
+            hit = next((a.lower() for a in ADDR_RE.findall(heads) if a.lower() in known), None)
             if not hit:
                 continue
             body, subj = _body(msg), _dec(msg.get("Subject"))
