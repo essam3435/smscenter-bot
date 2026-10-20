@@ -3198,6 +3198,7 @@ async def main() -> int:
     from aiogram import Bot, Dispatcher, F
     from aiogram.types import BotCommand, CallbackQuery, Message
 
+    existed = os.path.exists(STATE_PATH)
     st = Store(STATE_PATH)
     if not await setup(st, force="--setup" in sys.argv):
         return 1
@@ -3238,6 +3239,13 @@ async def main() -> int:
 
     await bot.set_my_commands([BotCommand(command="menu", description="Main menu")])                # the only command in the Telegram menu: everything else is buttons
     print(f"Running as @{me.username}. " + ("Admin is set." if st.d["admin"] else "Open the bot and send /start to become the admin."))
+    try:
+        profs = [*st.d["users"].values(), *([st.d["legacy"]] if st.d.get("legacy") else [])]
+        n_hunters = sum(len(p.get("hunters") or {}) for p in profs)
+        run_id = os.environ.get("GITHUB_RUN_ID")
+        await bot.send_message(st.d["admin"], f"Bot started. state.json {'loaded' if existed else '<b>not found</b> (fresh state)'}, hunters: <b>{n_hunters}</b>" + (f", run <code>{run_id}</code>" if run_id else ""), parse_mode="HTML")
+    except Exception as e:                                                # noqa: BLE001
+        log.warning("start notice failed: %s", e)
     hub.start_saved()                                                     # everybody's saved tracking resumes
     try:
         await dp.start_polling(bot)
