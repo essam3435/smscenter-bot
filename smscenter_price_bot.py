@@ -3324,7 +3324,8 @@ class Hub:
             while self.logins.get(uid) is st and st.get("stage") == "qr":
                 buf = io.BytesIO()
                 segno.make(st["qr"].url, error="m").save(buf, kind="png", scale=8, border=3)
-                m = await self.bot.send_photo(uid, BufferedInputFile(buf.getvalue(), "qr.png"), caption="Scan me: Settings → Devices → Link Desktop Device")
+                m = await self.bot.send_photo(uid, BufferedInputFile(buf.getvalue(), "qr.png"), parse_mode="HTML",
+                                              caption=f'Scan me (Settings → Devices → Link Desktop Device), or on this phone just tap: <a href="{html.escape(st["qr"].url)}">🔗 Log in</a>')
                 for old in st["qr_msgs"]:
                     try:
                         await self.bot.delete_message(uid, old)
