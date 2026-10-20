@@ -26,7 +26,7 @@ Run:   python scripts/smscenter_price_bot.py
   First time it asks for the bot token (from @BotFather). Open the bot and send /start: the first person to do that becomes
   the ADMIN. MANY USERS can use the bot: every user has their own profile (own SmsCenter key via  /setkey <key>, own tracks,
   own intervals and alerts) and alerts are sent to them privately. The admin can close the bot to everyone else:
-  /access open|closed · /allow <id> · /deny <id> · /users
+  /access open|closed · /allow <id> · /deny <id> · /users  · /session (new checker Telethon session)
 
 How you use it (all buttons):
   1. 📱 Platforms  -> pick a platform (e.g. Telegram)
@@ -1441,6 +1441,7 @@ class App:
               [(("✅ " if e in self.s.endpoints else "▫️ ") + ENDPOINTS[e], f"s:e:{e}") for e in ("offer", "list")],
               [(("✅ " if "count" in self.s.endpoints else "▫️ ") + ENDPOINTS["count"], "s:e:count")],
               [("🔕 30m", "s:mute:30"), ("🔕 2h", "s:mute:120"), ("🔔 unmute", "s:mute:0")],
+              *([[("🔐 Checker session", "sess:go")]] if self.s.store.d["admin"] == self.uid else []),
               [("🏠 Menu", "m")]]
         return ("⚙️ <b>Settings</b>\nRow 1-2: DEFAULT check interval (a track can override it in its control center) · Row 3: default drop % · "
                 "then which of the 3 endpoints to watch · mute everything.\n"
@@ -3005,7 +3006,9 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session"}
+LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
+SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
 
 class Hub:
@@ -3015,6 +3018,7 @@ class Hub:
         self.store, self.bot = store, bot
         self.apps: dict[int, App] = {}
         self.tasks: dict[int, asyncio.Task] = {}
+        self.logins: dict[int, dict] = {}                                # admin uid -> half-finished Telethon login {client, phone, hash, stage, timer}
         self.mail_task: asyncio.Task | None = None              # the one watcher of the catch-all Gmail, for every user
         self.mail_err = ""
 
@@ -3107,14 +3111,131 @@ class Hub:
             return ("👑 You are the <b>admin</b> of this bot (/users · /access · /allow · /deny).\n\n" + res[0], res[1]) if res else res
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
+        if cmd == "/session" and uid != d["admin"]:
+            return "Only the admin can do that.", None
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
+        if uid == d["admin"] and uid in self.logins and not cmd.startswith("/"):
+            return await self.login_step(uid, text)
         return await self.app(uid).handle(uid, text)
 
     async def ui(self, uid: int, data: str) -> Reply | None:
         if not self.allowed(uid):
             return None
+        if data.startswith("sess:"):
+            if uid != self.store.d["admin"]:
+                return None
+            if data == "sess:x":
+                await self.login_drop(uid)
+                return "Cancelled.", _nav()
+            return await self.login_start(uid)
         return await self.app(uid).ui(uid, data)
+
+    # -- new Telethon session for the number checker, created from the admin's chat (nothing secret goes through workflow inputs or logs)
+    async def login_drop(self, uid: int) -> None:
+        st = self.logins.pop(uid, None)
+        if st:
+            if st.get("timer"):
+                st["timer"].cancel()
+            if st.get("client"):
+                try:
+                    await st["client"].disconnect()
+                except Exception:                                        # noqa: BLE001
+                    pass
+
+    def login_arm(self, uid: int, st: dict) -> None:
+        if st.get("timer"):
+            st["timer"].cancel()
+        st["timer"] = asyncio.get_running_loop().call_later(LOGIN_TTL, lambda: asyncio.create_task(self.login_expire(uid, st)))
+
+    async def login_expire(self, uid: int, st: dict) -> None:
+        if self.logins.get(uid) is not st:
+            return
+        await self.login_drop(uid)
+        try:
+            await self.bot.send_message(uid, "⏱ The Telegram login timed out (5 min). Send /session to start again.")
+        except Exception:                                                # noqa: BLE001
+            pass
+
+    async def login_start(self, uid: int) -> Reply:
+        await self.login_drop(uid)
+        st = self.logins[uid] = {"client": None, "phone": "", "hash": "", "stage": "phone", "timer": None}
+        self.login_arm(uid, st)
+        self.app(uid).wipe_input = False
+        return ("🔐 <b>New checker session</b>\nSend the phone number of the Telegram account the checker should use, in international format (<code>+15551234567</code>). "
+                "I delete your message right after.\n<i>The old session file is replaced.</i>"), [[("Cancel", "sess:x")]]
+
+    async def login_step(self, uid: int, text: str) -> Reply:
+        st = self.logins[uid]
+        self.app(uid).wipe_input = True                                  # phone, code and password must not stay in the chat
+        self.login_arm(uid, st)
+        cancel = [[("Cancel", "sess:x")]]
+        try:
+            from telethon import TelegramClient
+            from telethon.errors import (FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError, PhoneCodeInvalidError,
+                                         PhoneNumberInvalidError, SessionPasswordNeededError)
+        except ImportError:
+            await self.login_drop(uid)
+            return "Telethon is not installed on this bot.", _nav()
+        try:
+            if st["stage"] == "phone":
+                phone = "+" + re.sub(r"\D", "", text)
+                if len(phone) < 8:
+                    return "That doesn't look like a phone number. Send it like <code>+15551234567</code>.", cancel
+                cr = PhoneChecker.creds()
+                if not cr:
+                    await self.login_drop(uid)
+                    return "No Telegram api id/hash configured (SMSCENTER_TG_API_ID / SMSCENTER_TG_API_HASH).", _nav()
+                await CHECKER.close()                                    # it holds the old file open
+                for f in (SESSION_BASE + ".session", SESSION_BASE + ".session-journal"):
+                    try:
+                        os.remove(f)
+                    except FileNotFoundError:
+                        pass
+                st["client"] = TelegramClient(SESSION_BASE, cr[0], cr[1])
+                await st["client"].connect()
+                sent = await st["client"].send_code_request(phone)
+                st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
+                return ("📨 Telegram sent you a login code. Type it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code> - "
+                        "Telegram cancels codes that are sent to it as plain digits. I delete your message right after."), cancel
+            if st["stage"] == "code":
+                code = re.sub(r"\D", "", text)
+                if not code:
+                    return "Send the code you received, digits with spaces or dashes (<code>1 2 3 4 5</code>).", cancel
+                try:
+                    await st["client"].sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
+                except SessionPasswordNeededError:
+                    st["stage"] = "pw"
+                    return "🔒 This account has 2-step verification. Send its password. I delete your message right after.", cancel
+            else:
+                await st["client"].sign_in(password=text)
+            me = await st["client"].get_me()
+            try:
+                st["client"].session.save()
+            except Exception:                                            # noqa: BLE001
+                pass
+            await self.login_drop(uid)                                   # disconnect closes the session file
+            CHECKER.err, CHECKER.retry_at = "", 0.0
+            await CHECKER.close()                                        # reconnects with the new file on the next check
+            who = html.escape(me.first_name or "") + (f" (@{html.escape(me.username)})" if me.username else "")
+            return f"✅ Checker session created for <b>{who.strip()}</b>.", _nav()
+        except PhoneCodeInvalidError:
+            return "❌ Wrong code. Type it again (with spaces), or Cancel.", cancel
+        except PhoneCodeExpiredError:
+            await self.login_drop(uid)
+            return "⌛ That code expired. Send /session to start again.", _nav()
+        except PasswordHashInvalidError:
+            return "❌ Wrong password. Send it again, or Cancel.", cancel
+        except FloodWaitError as e:
+            await self.login_drop(uid)
+            return f"⏳ Telegram says wait {e.seconds} seconds before trying again.", _nav()
+        except PhoneNumberInvalidError:
+            await self.login_drop(uid)
+            return "❌ Telegram says that phone number is invalid. Send /session to try again.", _nav()
+        except Exception as e:                                           # noqa: BLE001  (never put e's text in the reply/log: it could echo input)
+            await self.login_drop(uid)
+            log.warning("session login failed: %s", type(e).__name__)
+            return f"❌ Login failed: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
 
     async def admin(self, cmd: str, arg: str) -> Reply:
         d = self.store.d
@@ -3144,6 +3265,8 @@ class Hub:
                 self.sync()
             self.store.save()
             return (f"{uid} allowed." if cmd == "/allow" else f"{uid} blocked."), _nav()
+        if cmd == "/session":
+            return await self.login_start(d["admin"])
         lines = [f"Access: {d['access']}", f"Allowed IDs: {', '.join(map(str, d['allowed'])) or '-'}", f"Blocked IDs: {', '.join(map(str, d['blocked'])) or '-'}", ""]
         for k, prof in d["users"].items():
             n = sum(1 for t in prof.get("tracks", {}).values() if t.get("on"))

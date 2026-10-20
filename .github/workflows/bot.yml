@@ -21,7 +21,9 @@ jobs:
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
-          path: state.json
+          path: |
+            state.json
+            gh_checker.session
           key: bot-state-never-matches
           restore-keys: bot-state
 
@@ -40,14 +42,16 @@ jobs:
           SMSCENTER_TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
         run: |
-          if [ -n "$TG_SESSION_B64" ]; then printf '%s' "$TG_SESSION_B64" | tr -d '\r\n ' | base64 -d > gh_checker.session; fi
+          if [ ! -e gh_checker.session ] && [ -n "$TG_SESSION_B64" ]; then printf '%s' "$TG_SESSION_B64" | tr -d '\r\n ' | base64 -d > gh_checker.session; fi
           timeout --signal=INT --kill-after=60 330m python smscenter_price_bot.py || [ $? -eq 124 ]
 
       - name: Save state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: state.json
+          path: |
+            state.json
+            gh_checker.session
           key: bot-state-${{ github.run_id }}
 
       - name: Restart
