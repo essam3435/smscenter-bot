@@ -76,6 +76,21 @@ if HERE_DIR not in sys.path:
 import catchall  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _admin_id() -> int | None:
+    """Admin Telegram id: SMSCENTER_ADMIN_ID if set and numeric, else admin_id from config.json next to the script."""
+    env = os.environ.get("SMSCENTER_ADMIN_ID", "").strip()
+    if env.isdigit():
+        return int(env)
+    try:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+            v = json.load(f).get("admin_id")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
 STATE_PATH = os.environ.get("SMSCENTER_BOT_STATE") or os.path.join(HERE, ".smscenter_bot.json")
 BASE_URL = "https://smscenter.pro/api"
 DEFAULT_SVC = "tg"
@@ -475,6 +490,12 @@ class Store:
                 self.d["users"].setdefault(str(owner), legacy)
             else:
                 self.d["legacy"] = legacy
+        admin = _admin_id()
+        if admin:                                                        # the configured admin always wins over the saved one
+            self.d["admin"] = admin
+            if self.d.get("legacy"):
+                self.d["users"].setdefault(str(admin), self.d.pop("legacy"))
+                self.d["legacy"] = None
         for prof in self.d["users"].values():
             normalize(prof)
         if self.d.get("legacy"):
