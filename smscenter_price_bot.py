@@ -3019,7 +3019,7 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr"}
 LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
 SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
@@ -3132,9 +3132,9 @@ class Hub:
             return ("👑 You are the <b>admin</b> of this bot (/users · /access · /allow · /deny).\n\n" + res[0], res[1]) if res else res
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
-        if cmd in ("/session", "/proxies") and uid != d["admin"]:
+        if cmd in ("/session", "/proxies", "/sessionstr") and uid != d["admin"]:
             return "Only the admin can do that.", None
-        if cmd == "/proxies":
+        if cmd in ("/proxies", "/sessionstr"):
             self.app(uid).wipe_input = True                              # the list holds passwords: delete the message
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
@@ -3255,6 +3255,33 @@ class Hub:
             await self.login_drop(uid)
             self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
+
+    async def session_from_string(self, text: str) -> Reply:
+        """Checker session from a Telethon StringSession made on the admin's own device (the code then arrives in the Telegram app on that device)."""
+        if not text:
+            return "Make the string on your phone (Termux, <code>make_session.py</code>), then send <code>/sessionstr &lt;string&gt;</code>. I delete your message right after.", _nav()
+        try:
+            from telethon.sessions import SQLiteSession, StringSession
+            ss = StringSession(text)
+            if not ss.auth_key:
+                raise ValueError("no auth key")
+            await CHECKER.close()                                        # it holds the old file open
+            for f in (SESSION_BASE + ".session", SESSION_BASE + ".session-journal"):
+                try:
+                    os.remove(f)
+                except FileNotFoundError:
+                    pass
+            sq = SQLiteSession(SESSION_BASE)
+            sq.set_dc(ss.dc_id, ss.server_address, ss.port)
+            sq.auth_key = ss.auth_key
+            sq.save()
+            sq.close()
+        except Exception as e:                                           # noqa: BLE001  (never echo the text: it is a login)
+            log.warning("session string rejected: %s", type(e).__name__)
+            return f"❌ That is not a valid session string ({html.escape(type(e).__name__)}). Nothing was changed.", _nav()
+        CHECKER.err, CHECKER.retry_at = "", 0.0
+        log.info("checker session saved from a string")
+        return "✅ Checker session saved (your message is deleted). The next check uses it.", _nav()
 
     async def login_client(self, uid: int, st: dict) -> bool:
         """Connect the Telethon client of this login (new session file, through the proxies); False when no api id/hash is set."""
@@ -3438,6 +3465,8 @@ class Hub:
 
     async def admin(self, cmd: str, arg: str) -> Reply:
         d = self.store.d
+        if cmd == "/sessionstr":
+            return await self.session_from_string(arg.strip())
         if cmd == "/proxies":
             from tgbot_checker import proxies
             if arg.strip().lower() == "clear":
