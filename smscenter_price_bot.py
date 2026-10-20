@@ -3141,6 +3141,8 @@ class Hub:
             if data == "sess:x":
                 await self.login_drop(uid)
                 return "Cancelled.", _nav()
+            if data in ("sess:sms", "sess:call"):
+                return await self.login_resend(uid, data[5:])
             return await self.login_start(uid)
         return await self.app(uid).ui(uid, data)
 
@@ -3178,6 +3180,52 @@ class Hub:
         return ("🔐 <b>New checker session</b>\nSend the phone number of the Telegram account the checker should use, in international format (<code>+15551234567</code>). "
                 "I delete your message right after.\n<i>The old session file is replaced.</i>"), [[("Cancel", "sess:x")]]
 
+    @staticmethod
+    def code_where(sent: Any, phone: str) -> tuple[str, list]:
+        """Plain-words 'where to look' text for a SentCode, and the resend buttons its next_type allows (no code/hash/full phone)."""
+        def kind(t: Any) -> str:
+            return type(t).__name__.replace("SentCodeType", "") if t is not None else ""
+        k, nk = kind(getattr(sent, "type", None)), kind(getattr(sent, "next_type", None))
+        tail = html.escape(phone[-2:])
+        where = {"App": "in the <b>Telegram app</b>, in the chat named <b>Telegram</b> (open this account on another device)",
+                 "Sms": f"by <b>SMS</b> to the number ending in <code>{tail}</code>",
+                 "FirebaseSms": f"by <b>SMS</b> to the number ending in <code>{tail}</code>",
+                 "Call": "by <b>phone call</b> (a voice reads the code)",
+                 "FlashCall": "by a <b>flash call</b> (a missed call whose number is the code)",
+                 "MissedCall": "by a <b>missed call</b> (the last digits of the caller's number are the code)",
+                 "EmailCode": "by <b>email</b> to the address set on that account"}.get(k, f"by an unusual method (<code>{html.escape(k or 'unknown')}</code>)")
+        nxt = {"Sms": "an SMS", "Call": "a phone call", "FlashCall": "a flash call", "MissedCall": "a missed call"}.get(nk)
+        text = f"📨 Telegram says it sent the login code {where}."
+        if nxt:
+            text += f"\nIf it doesn't arrive, the next option is {nxt} (use the button below)."
+        else:
+            text += "\nNo other delivery method is available now; if nothing arrives, wait a few minutes and start again."
+        row = []
+        if nk == "Sms":
+            row.append(("📩 Resend by SMS", "sess:sms"))
+        if nk == "Call":
+            row.append(("📞 Call me", "sess:call"))
+        return text, ([row] if row else []) + [[("Cancel", "sess:x")]]
+
+    async def login_resend(self, uid: int, how: str) -> Reply:
+        st = self.logins.get(uid)
+        if not st or st.get("stage") != "code" or not st.get("client"):
+            return "No login is waiting for a code. Send /session to start.", _nav()
+        self.login_arm(uid, st)
+        try:
+            from telethon.errors import FloodWaitError
+            from telethon.tl.functions.auth import ResendCodeRequest
+            sent = await st["client"](ResendCodeRequest(st["phone"], st["hash"]))
+            st["hash"] = sent.phone_code_hash
+            text, kb = self.code_where(sent, st["phone"])
+            return text + "\nType it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code>.", kb
+        except FloodWaitError as e:
+            return f"⏳ Telegram says wait {e.seconds} seconds before asking for another code.", [[("Cancel", "sess:x")]]
+        except Exception as e:                                           # noqa: BLE001
+            await self.login_drop(uid)
+            log.warning("session code resend failed: %s", type(e).__name__)
+            return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
+
     async def login_step(self, uid: int, text: str) -> Reply:
         st = self.logins[uid]
         self.app(uid).wipe_input = True                                  # phone, code and password must not stay in the chat
@@ -3185,8 +3233,9 @@ class Hub:
         cancel = [[("Cancel", "sess:x")]]
         try:
             from telethon import TelegramClient
-            from telethon.errors import (FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError, PhoneCodeInvalidError,
-                                         PhoneNumberInvalidError, SessionPasswordNeededError)
+            from telethon.errors import (ApiIdInvalidError, FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError,
+                                         PhoneCodeInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
+                                         PhoneNumberInvalidError, SendCodeUnavailableError, SessionPasswordNeededError)
         except ImportError:
             await self.login_drop(uid)
             return "Telethon is not installed on this bot.", _nav()
@@ -3209,8 +3258,9 @@ class Hub:
                 await st["client"].connect()
                 sent = await st["client"].send_code_request(phone)
                 st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
-                return ("📨 Telegram sent you a login code. Type it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code> - "
-                        "Telegram cancels codes that are sent to it as plain digits. I delete your message right after."), cancel
+                where, kb = self.code_where(sent, phone)
+                return (where + "\nType it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code> - "
+                        "Telegram cancels codes that are sent to it as plain digits. I delete your message right after."), kb
             if st["stage"] == "code":
                 code = re.sub(r"\D", "", text)
                 if not code:
@@ -3245,6 +3295,18 @@ class Hub:
         except PhoneNumberInvalidError:
             await self.login_drop(uid)
             return "❌ Telegram says that phone number is invalid. Send /session to try again.", _nav()
+        except SendCodeUnavailableError:
+            await self.login_drop(uid)
+            return "❌ Telegram has no way left to send a code to this number right now (all methods used or blocked). Wait a while, then send /session.", _nav()
+        except PhoneNumberBannedError:
+            await self.login_drop(uid)
+            return "❌ Telegram says this phone number is banned.", _nav()
+        except PhoneNumberFloodError:
+            await self.login_drop(uid)
+            return "❌ Telegram says this number asked for too many codes. Try again much later.", _nav()
+        except ApiIdInvalidError:
+            await self.login_drop(uid)
+            return "❌ The Telegram api id/hash is invalid (SMSCENTER_TG_API_ID / SMSCENTER_TG_API_HASH).", _nav()
         except Exception as e:                                           # noqa: BLE001  (never put e's text in the reply/log: it could echo input)
             await self.login_drop(uid)
             log.warning("session login failed: %s", type(e).__name__)
