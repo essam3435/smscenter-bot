@@ -3019,7 +3019,7 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies"}
 LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
 SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
@@ -3098,8 +3098,14 @@ class Hub:
             if not self.allowed(uid):
                 self.stop(uid)
 
+    def apply_proxies(self) -> None:
+        """Telethon proxies: the SMSCENTER_TG_PROXIES secret wins, else the list the admin gave with /proxies (stored sealed)."""
+        if not os.environ.get("SMSCENTER_TG_PROXIES", "").strip() and self.store.d.get("proxies"):
+            os.environ["SMSCENTER_TG_PROXIES"] = unseal(self.store.d["proxies"])
+
     def start_saved(self) -> None:
         """Resume tracking for every user already in the file."""
+        self.apply_proxies()
         for k in list(self.store.d["users"]):
             if k.lstrip("-").isdigit() and self.allowed(int(k)):
                 self.app(int(k))
@@ -3113,7 +3119,8 @@ class Hub:
 
     async def handle(self, uid: int, text: str) -> Reply | None:
         d = self.store.d
-        cmd, _, arg = text.strip().partition(" ")
+        head = text.strip().split(None, 1)                               # a command may be followed by a space or a new line
+        cmd, arg = (head[0] if head else ""), (head[1] if len(head) > 1 else "")
         cmd = cmd.split("@")[0].lower()
         if cmd == "/start" and d["admin"] is None:                       # the first person to /start is the admin
             d["admin"] = uid
@@ -3125,8 +3132,10 @@ class Hub:
             return ("👑 You are the <b>admin</b> of this bot (/users · /access · /allow · /deny).\n\n" + res[0], res[1]) if res else res
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
-        if cmd == "/session" and uid != d["admin"]:
+        if cmd in ("/session", "/proxies") and uid != d["admin"]:
             return "Only the admin can do that.", None
+        if cmd == "/proxies":
+            self.app(uid).wipe_input = True                              # the list holds passwords: delete the message
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
         if uid == d["admin"] and uid in self.logins and not cmd.startswith("/"):
@@ -3342,6 +3351,29 @@ class Hub:
 
     async def admin(self, cmd: str, arg: str) -> Reply:
         d = self.store.d
+        if cmd == "/proxies":
+            from tgbot_checker import proxies
+            if arg.strip().lower() == "clear":
+                d.pop("proxies", None)
+                os.environ.pop("SMSCENTER_TG_PROXIES", None)
+                self.store.save()
+                await CHECKER.close()
+                return "Proxies cleared. Telegram logins connect directly.", _nav()
+            if arg.strip():
+                prev = os.environ.get("SMSCENTER_TG_PROXIES")
+                os.environ["SMSCENTER_TG_PROXIES"] = arg
+                n = len(proxies())
+                if not n:
+                    if prev is None:
+                        os.environ.pop("SMSCENTER_TG_PROXIES", None)
+                    else:
+                        os.environ["SMSCENTER_TG_PROXIES"] = prev
+                    return "No proxy found. Send /proxies, a new line, then one <code>host:port:user:pass</code> per line.", _nav()
+                self.store.set_secret("proxies", arg)
+                await CHECKER.close()                                    # reconnects through the proxies
+                return f"✅ Saved {n} proxies (your message is deleted). The next /session login and the checker use them.", _nav()
+            n = len(proxies())
+            return (f"{n} proxies are set." if n else "No proxies set.") + "\nSend /proxies, a new line, then one <code>host:port:user:pass</code> per line. <code>/proxies clear</code> removes them.", _nav()
         if cmd == "/access":
             v = arg.strip().lower()
             if v not in ("open", "closed"):
