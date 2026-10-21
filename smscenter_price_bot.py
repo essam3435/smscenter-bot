@@ -3019,7 +3019,7 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr", "/sessionuser"}
 LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
 SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
@@ -3031,6 +3031,7 @@ class Hub:
         self.store, self.bot = store, bot
         self.apps: dict[int, App] = {}
         self.tasks: dict[int, asyncio.Task] = {}
+        self.wipe: set[int] = set()                                      # users without an App (session-only) whose next message must be deleted
         self.login_logs: dict[int, list[str]] = {}                       # admin uid -> last login events (class names/types only, never secrets)
         self.logins: dict[int, dict] = {}                                # admin uid -> half-finished Telethon login {client, phone, hash, stage, timer}
         self.mail_task: asyncio.Task | None = None              # the one watcher of the catch-all Gmail, for every user
@@ -3117,8 +3118,40 @@ class Hub:
             self.mail_task.cancel()
             self.mail_task = None
 
-    async def handle(self, uid: int, text: str) -> Reply | None:
+    def is_session_user(self, uid: int) -> bool:
+        """A non-admin who may use /session and nothing else (the admin adds them with /sessionuser)."""
         d = self.store.d
+        return uid != d["admin"] and uid in d.get("session_users", [])
+
+    def bind_session_user(self, uid: int, username: str | None) -> None:
+        """/sessionuser @name is stored by name until that person writes to the bot; then it is bound to their id."""
+        d = self.store.d
+        if username and username.lower() in d.get("session_names", []) and uid != d["admin"]:
+            d["session_names"].remove(username.lower())
+            if uid not in d.setdefault("session_users", []):
+                d["session_users"].append(uid)
+            self.store.save()
+
+    def set_wipe(self, uid: int, flag: bool) -> None:
+        """Delete (or not) the message being handled: it holds a phone, code, password or proxy list."""
+        if uid in self.apps:
+            self.apps[uid].wipe_input = flag
+        elif flag:
+            self.wipe.add(uid)
+        else:
+            self.wipe.discard(uid)
+
+    def take_wipe(self, uid: int) -> bool:
+        app_ = self.apps.get(uid)
+        flag = bool(app_ and app_.wipe_input) or uid in self.wipe
+        if app_:
+            app_.wipe_input = False
+        self.wipe.discard(uid)
+        return flag
+
+    async def handle(self, uid: int, text: str, username: str | None = None) -> Reply | None:
+        d = self.store.d
+        self.bind_session_user(uid, username)
         head = text.strip().split(None, 1)                               # a command may be followed by a space or a new line
         cmd, arg = (head[0] if head else ""), (head[1] if len(head) > 1 else "")
         cmd = cmd.split("@")[0].lower()
@@ -3130,23 +3163,33 @@ class Hub:
             self.store.save()
             res = await self.app(uid).handle(uid, text)
             return ("👑 You are the <b>admin</b> of this bot (/users · /access · /allow · /deny).\n\n" + res[0], res[1]) if res else res
+        if self.is_session_user(uid):                                    # /session and its login steps only: no profile, no tracker, nothing else
+            if cmd == "/session":
+                return await self.login_start(uid)
+            if uid in self.logins and not cmd.startswith("/"):
+                return await self.login_step(uid, text)
+            return "You can only use /session (it creates the number-checker's Telegram session).", None
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
-        if cmd in ("/session", "/proxies", "/sessionstr") and uid != d["admin"]:
+        if cmd in ("/session", "/proxies", "/sessionstr", "/sessionuser") and uid != d["admin"]:
             return "Only the admin can do that.", None
         if cmd in ("/proxies", "/sessionstr"):
-            self.app(uid).wipe_input = True                              # the list holds passwords: delete the message
+            self.set_wipe(uid, True)                                     # the list holds passwords: delete the message
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
         if uid == d["admin"] and uid in self.logins and not cmd.startswith("/"):
             return await self.login_step(uid, text)
         return await self.app(uid).handle(uid, text)
 
-    async def ui(self, uid: int, data: str) -> Reply | None:
-        if not self.allowed(uid):
+    async def ui(self, uid: int, data: str, username: str | None = None) -> Reply | None:
+        self.bind_session_user(uid, username)
+        if self.is_session_user(uid):
+            if not data.startswith("sess:"):
+                return None
+        elif not self.allowed(uid):
             return None
         if data.startswith("sess:"):
-            if uid != self.store.d["admin"]:
+            if uid != self.store.d["admin"] and not self.is_session_user(uid):
                 return None
             if data == "sess:x":
                 await self.login_drop(uid)
@@ -3204,7 +3247,7 @@ class Hub:
         self.login_note(uid, "login started")
         st = self.logins[uid] = {"client": None, "phone": "", "hash": "", "stage": "phone", "timer": None}
         self.login_arm(uid, st)
-        self.app(uid).wipe_input = False
+        self.set_wipe(uid, False)
         return ("🔐 <b>New checker session</b>\nSend the phone number of the Telegram account the checker should use, in international format (<code>+15551234567</code>). "
                 "I delete your message right after.\n<i>The old session file is replaced.</i>\n\nNo code arriving? Use QR login instead."), [[("🔳 Log in by QR (no code)", "sess:qr")], [("Cancel", "sess:x")]]
 
@@ -3255,6 +3298,30 @@ class Hub:
             await self.login_drop(uid)
             self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
+
+    def session_users_cmd(self, arg: str) -> Reply:
+        """/sessionuser @name|id adds a session-only user, /sessionuser remove @name|id removes one, /sessionuser lists."""
+        d = self.store.d
+        users, names = d.setdefault("session_users", []), d.setdefault("session_names", [])
+        remove = arg.lower().startswith("remove")
+        who = arg[6:].strip() if remove else arg
+        if who:
+            if who.lstrip("@").lstrip("-").isdigit():
+                key, bucket = int(who.lstrip("@")), users
+            elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{4,31}", who):
+                key, bucket = who.lstrip("@").lower(), names
+            else:
+                return "Usage: <code>/sessionuser @username</code> or <code>/sessionuser 123456789</code>; <code>/sessionuser remove @username</code>; <code>/sessionuser</code> lists.", _nav()
+            if remove:
+                for b in (users, names):
+                    if key in b:
+                        b.remove(key)
+            elif key not in bucket:
+                bucket.append(key)
+            self.store.save()
+        lines = [f"• <code>{u}</code>" for u in users] + [f"• @{html.escape(n)} (not seen yet)" for n in names]
+        head = ("Removed. " if remove and who else "Added. " if who else "")
+        return head + "Session-only users (they can use /session and nothing else):\n" + ("\n".join(lines) or "none"), _nav()
 
     async def session_from_string(self, text: str) -> Reply:
         """Checker session from a Telethon StringSession made on the admin's own device (the code then arrives in the Telegram app on that device)."""
@@ -3317,6 +3384,12 @@ class Hub:
         CHECKER.err, CHECKER.retry_at = "", 0.0
         await CHECKER.close()                                            # reconnects with the new file on the next check
         who = html.escape(me.first_name or "") + (f" (@{html.escape(me.username)})" if me.username else "")
+        admin = self.store.d["admin"]
+        if uid != admin and admin:
+            try:
+                await self.bot.send_message(admin, f"ℹ️ Session-only user <code>{uid}</code> created a new checker session for <b>{who.strip()}</b>.", parse_mode="HTML")
+            except Exception:                                            # noqa: BLE001
+                pass
         return f"✅ Checker session created for <b>{who.strip()}</b>.", _nav()
 
     async def login_qr(self, uid: int) -> Reply:
@@ -3368,7 +3441,7 @@ class Hub:
                 except SessionPasswordNeededError:
                     st["stage"] = "pw"
                     self.login_note(uid, "QR scanned, 2-step password needed")
-                    self.app(uid).wipe_input = True
+                    self.set_wipe(uid, True)
                     await self.bot.send_message(uid, "🔒 QR accepted. This account has 2-step verification. Send its password. I delete your message right after.")
                     return
                 self.login_note(uid, "QR scanned")
@@ -3386,7 +3459,7 @@ class Hub:
 
     async def login_step(self, uid: int, text: str) -> Reply:
         st = self.logins[uid]
-        self.app(uid).wipe_input = True                                  # phone, code and password must not stay in the chat
+        self.set_wipe(uid, True)                                         # phone, code and password must not stay in the chat
         self.login_arm(uid, st)
         cancel = [[("Cancel", "sess:x")]]
         if st["stage"] == "qr":
@@ -3467,6 +3540,8 @@ class Hub:
         d = self.store.d
         if cmd == "/sessionstr":
             return await self.session_from_string(arg.strip())
+        if cmd == "/sessionuser":
+            return self.session_users_cmd(arg.strip())
         if cmd == "/proxies":
             from tgbot_checker import proxies
             if arg.strip().lower() == "clear":
@@ -3643,11 +3718,8 @@ async def main() -> int:
 
     @dp.message(F.text, F.chat.type == "private")
     async def on_text(m: Message):
-        res = await hub.handle(m.from_user.id, m.text)
-        app_ = hub.apps.get(m.from_user.id)
-        wipe = bool(app_ and app_.wipe_input)
-        if app_:
-            app_.wipe_input = False
+        res = await hub.handle(m.from_user.id, m.text, m.from_user.username)
+        wipe = hub.take_wipe(m.from_user.id)
         if m.text.startswith("/setkey") or wipe:
             try:
                 await m.delete()                                          # don't leave the key in the chat
@@ -3662,7 +3734,7 @@ async def main() -> int:
             await q.answer()                                              # first: a slow screen must not make the tap "too old"; old taps from when the bot was off are just ignored
         except Exception:                                                 # noqa: BLE001
             pass
-        res = await hub.ui(q.from_user.id, q.data or "")
+        res = await hub.ui(q.from_user.id, q.data or "", q.from_user.username)
         try:
             if res:
                 await q.message.edit_text(res[0], parse_mode="HTML", disable_web_page_preview=True, reply_markup=to_markup(res[1]))
