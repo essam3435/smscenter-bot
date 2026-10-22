@@ -3196,6 +3196,8 @@ class Hub:
                 return "Cancelled.", _nav()
             if data == "sess:qr":
                 return await self.login_qr(uid)
+            if data.startswith("sess:k:"):
+                return await self.login_key(uid, data[7:])
             if data == "sess:log":
                 return self.login_log(uid), [[("📜 Refresh", "sess:log"), ("Cancel", "sess:x")]]
             if data in ("sess:sms", "sess:call"):
@@ -3278,6 +3280,44 @@ class Hub:
             row.append(("📞 Call me", "sess:call"))
         return text, ([row] if row else []) + [[("🔳 Log in by QR (no code)", "sess:qr")], [("📜 Log", "sess:log"), ("Cancel", "sess:x")]]
 
+    @staticmethod
+    def code_keypad() -> list:
+        """Number buttons for the login code: a tap is not a message, so Telegram can't see the code and cancel it."""
+        k = lambda t, d: (t, "sess:k:" + d)                              # noqa: E731
+        return [[k("1", "1"), k("2", "2"), k("3", "3")], [k("4", "4"), k("5", "5"), k("6", "6")],
+                [k("7", "7"), k("8", "8"), k("9", "9")], [k("⌫", "b"), k("0", "0"), k("✅ Send", "ok")]]
+
+    @staticmethod
+    def code_prompt(st: dict) -> str:
+        n = len(st.get("code_buf", ""))
+        return (st.get("code_head", "") + "\n\n<b>Code:</b> " + ("● " * n if n else "-") +
+                "\nTap the digits below, then <b>✅ Send</b>. <i>Don't type the code in the chat: Telegram cancels any code sent as a message.</i>")
+
+    async def login_key(self, uid: int, key: str) -> Reply:
+        st = self.logins.get(uid)
+        if not st or st.get("stage") != "code":
+            return "No login is waiting for a code. Send /session to start.", _nav()
+        self.login_arm(uid, st)
+        buf = st.get("code_buf", "")
+        if key == "ok":
+            if len(buf) < 4:
+                return "Tap at least 4 digits first.\n" + self.code_prompt(st), self.code_keypad() + [[("Cancel", "sess:x")]]
+            st["code_buf"] = ""
+            res = await self.login_step(uid, buf)
+            self.set_wipe(uid, False)                                    # nothing was typed in the chat: don't delete the next message
+            return res
+        if key == "b":
+            buf = buf[:-1]
+        elif key.isdigit() and len(buf) < 8:
+            buf += key
+        st["code_buf"] = buf
+        _, kb = self.code_where_kb(st)
+        return self.code_prompt(st), self.code_keypad() + kb
+
+    @staticmethod
+    def code_where_kb(st: dict) -> tuple[str, list]:
+        return "", st.get("code_kb") or [[("Cancel", "sess:x")]]
+
     async def login_resend(self, uid: int, how: str) -> Reply:
         st = self.logins.get(uid)
         if not st or st.get("stage") != "code" or not st.get("client"):
@@ -3290,7 +3330,8 @@ class Hub:
             st["hash"] = sent.phone_code_hash
             self.login_note(uid, f"resend ({how}): type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")
             text, kb = self.code_where(sent, st["phone"])
-            return text + "\nType it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code>.", kb
+            st["code_head"], st["code_buf"], st["code_kb"] = text, "", kb
+            return self.code_prompt(st), self.code_keypad() + kb
         except FloodWaitError as e:
             self.login_note(uid, f"FloodWaitError {e.seconds}s")
             return f"⏳ Telegram says wait {e.seconds} seconds before asking for another code.", [[("Cancel", "sess:x")]]
@@ -3482,8 +3523,8 @@ class Hub:
                 st.update(phone=phone, hash=sent.phone_code_hash, stage="code")
                 self.login_note(uid, f"code requested: type={type(sent.type).__name__} next={type(sent.next_type).__name__} timeout={getattr(sent, 'timeout', None)}")
                 where, kb = self.code_where(sent, phone)
-                return (where + "\nType it with <b>spaces or dashes</b> between the digits, e.g. <code>1 2 3 4 5</code> - "
-                        "Telegram cancels codes that are sent to it as plain digits. I delete your message right after."), kb
+                st["code_head"], st["code_buf"], st["code_kb"] = where, "", kb
+                return self.code_prompt(st), self.code_keypad() + kb
             if st["stage"] == "code":
                 code = re.sub(r"\D", "", text)
                 if not code:
@@ -3499,7 +3540,8 @@ class Hub:
             return await self.login_finish(uid, st)
         except PhoneCodeInvalidError:
             self.login_note(uid, "PhoneCodeInvalidError")
-            return "❌ Wrong code. Type it again (with spaces), or Cancel.", cancel
+            st["code_buf"] = ""
+            return "❌ Wrong code. Tap it again.\n" + self.code_prompt(st), self.code_keypad() + cancel
         except PhoneCodeExpiredError:
             self.login_note(uid, "PhoneCodeExpiredError")
             await self.login_drop(uid)
