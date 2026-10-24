@@ -66,6 +66,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -114,6 +115,8 @@ HUNT_FATAL = {"apiKeyNotFound": "SmsCenter rejected your API key",
               "noCountry": "SmsCenter doesn't know this country", "noService": "this platform isn't offered by SmsCenter",
               "badService": "this platform isn't offered here", "noOperator": "this operator isn't offered in this country",
               "badData": "SmsCenter rejected the request"}
+HUNT_FATAL.update({"nhKeyBad": "NumberHub rejected your API key", "dailyLimit": "NumberHub: this API key's daily spending limit is reached",
+                   "duplicateOrder": "NumberHub: 50 orders are already open for this platform + country (rejected numbers stay held ~2 min) - wait, or use a slower interval"})
 WATCH_MIN = 15.0                                        # a price watch scans ~250 countries each time, so it can't be as fast as a single track
 WATCH_PRESETS = (30, 60, 120, 300, 600)
 WATCH_CONC = 8                                          # parallel country requests during a scan
@@ -189,6 +192,18 @@ def flag(code: str) -> str:
     if re.fullmatch(r"[a-z]{2}", c):
         return chr(0x1F1E6 + ord(c[0]) - 97) + chr(0x1F1E6 + ord(c[1]) - 97)
     return "🌐"
+
+
+PROV_NAME = {"sc": "SmsCenter", "nh": "NumberHub"}
+
+
+def pn(o: dict) -> str:
+    """Which provider a hunter / bought number belongs to."""
+    return PROV_NAME.get(o.get("prov") or "sc", "SmsCenter")
+
+
+def fl(o: dict) -> str:
+    return flag(o.get("fl") or o["cc"])
 
 
 def fmt(v: float | None) -> str:
@@ -704,6 +719,104 @@ class SmsCenter:
         return parse_count(svc, await self._maybe("/getCountNumber", service=svc, country=cc, price="true"))
 
 
+NH_URL = "https://api.numberhub.io/v1"
+NH_ERR = {"sold_out": "noNumber", "price_exceeded": "noNumber", "price_changed": "noNumber", "rate_limited": "noNumber",
+          "insufficient_funds": "noMoney", "invalid_api_key": "nhKeyBad", "cancel_locked": "cancelLocked", "cancel_window_closed": "cancelLocked",
+          "duplicate_order": "duplicateOrder", "daily_spend_limit_exceeded": "dailyLimit", "unknown_service": "noService", "not_found": "idNumNotFound"}
+
+
+class NumberHub:
+    """numberhub.io API v1 with the calls the hunter uses on SmsCenter (get_number / v0_status / set_status / offer / balance), same error codes."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.http = httpx.AsyncClient(timeout=25.0, headers={"Authorization": "Bearer " + api_key})
+
+    async def close(self):
+        await self.http.aclose()
+
+    async def req(self, method: str, path: str, body: dict | None = None, idem: str | None = None, **params) -> Any:
+        try:
+            r = await self.http.request(method, NH_URL + path, params={k: v for k, v in params.items() if v not in (None, "")} or None,
+                                        json=body, headers={"Idempotency-Key": idem} if idem else None)
+            data = r.json()
+        except httpx.HTTPError as e:
+            raise SmsCenterError(f"network error: {redact(e)}") from e
+        except ValueError:
+            raise SmsCenterError(f"bad response (HTTP {r.status_code})")
+        if r.status_code >= 400:
+            err = str(data.get("error")) if isinstance(data, dict) else ""
+            raise SmsCenterError(NH_ERR.get(err, err or f"HTTP {r.status_code}"))
+        return data
+
+    async def services(self) -> dict[str, str]:
+        data = await self.req("GET", "/services")
+        return {str(x["code"]): str(x.get("name") or x["code"]) for x in (data.get("services") or []) if isinstance(x, dict) and x.get("code")}
+
+    async def countries_of(self, svc: str) -> list[dict]:
+        data = await self.req("GET", "/countries", service=svc)
+        return [c for c in (data.get("countries") or []) if isinstance(c, dict) and "country" in c]
+
+    async def operators(self, cc: str, svc: str) -> list[str]:
+        data = await self.req("GET", f"/countries/{cc}/operators", service=svc)
+        return [str(o) for o in (data.get("operators") or [])]
+
+    async def offer(self, svc: str, cc: str) -> dict | None:
+        """-> {"min", "api", "stock", "tiers"} like SmsCenter's offer (NumberHub has one price and an in-stock flag)."""
+        for c in await self.countries_of(svc):
+            if str(c["country"]) == str(cc):
+                price, ok = _num(c.get("price")), bool(c.get("in_stock"))
+                return {"min": price, "api": price, "stock": 1 if ok else 0, "tiers": [(price, 1 if ok else 0)] if price is not None else []}
+        return None
+
+    async def get_number(self, svc: str, cc: str, operator: str | None = None, max_price: float | None = None) -> dict:
+        """POST /numbers (synchronous: queue=false, so no stock = sold_out at once, nothing held) -> {"tel", "idNum", "price"}."""
+        body: dict[str, Any] = {"service": svc, "country": str(cc), "queue": False}
+        if operator:
+            body["operator"] = operator
+        if max_price:
+            body["max_price"] = f"{max(max_price, 0.01):.2f}"
+        data = await self.req("POST", "/numbers", body, idem=uuid.uuid4().hex)
+        n = data.get("number") if isinstance(data, dict) else None
+        if not isinstance(n, dict) or not n.get("phone") or not n.get("id"):
+            raise SmsCenterError("badResponse")
+        return {"tel": str(n["phone"]).lstrip("+"), "idNum": str(n["id"]), "price": _num(n.get("price"))}
+
+    async def balance(self) -> float | None:
+        data = await self.req("GET", "/balance")
+        return _num(data.get("available")) if isinstance(data, dict) else None
+
+    async def order(self, id_num: str) -> dict:
+        data = await self.req("GET", f"/numbers/{id_num}")
+        n = data.get("number") if isinstance(data, dict) else None
+        return n if isinstance(n, dict) else {}
+
+    async def v0_status(self, id_num: str) -> tuple[str, str | None]:
+        """('ok', code) | ('wait', None) | ('cancel', None) = NumberHub ended it (expired / cancelled) | ('?', None)."""
+        n = await self.order(id_num)
+        codes = n.get("codes") or []
+        code = n.get("code") or (codes[-1] if codes else None)
+        if code:
+            return "ok", str(code)
+        st = str(n.get("status") or "")
+        if st in ("canceled", "expired"):
+            return "cancel", None
+        if st in ("pending", "waiting"):
+            return "wait", None
+        return "?", None
+
+    async def sms_code(self, id_num: str) -> str | None:
+        n = await self.order(id_num)
+        codes = n.get("codes") or []
+        c = n.get("code") or (codes[-1] if codes else None)
+        return str(c) if c else None
+
+    async def set_status(self, id_num: str, status: str) -> str:
+        """DELETE /numbers/{id}: cancel + release the hold. 'cancelLocked' (raised) = too early, NumberHub accepts it only ~2 min after issue."""
+        await self.req("DELETE", f"/numbers/{id_num}")
+        return "ready"
+
+
 def parse_offer(svc: str, data) -> dict | None:
     o = data.get(svc) if isinstance(data, dict) else None
     if not isinstance(o, dict):
@@ -1122,6 +1235,7 @@ class App:
         self.checker = CHECKER                                  # shared Telegram-checker (one Telethon session for the whole bot)
         self.hunts: dict[str, asyncio.Task] = {}                # hunter id -> running hunt loop
         self.code_tasks: dict[str, asyncio.Task] = {}           # bought number (idNum) -> waiting for its code
+        self.bg: set = set()                                    # delayed cancels (NumberHub only accepts a cancel ~2 min after issue)
         self.hub: Hub | None = None                             # set by the Hub: owns the one catch-all mail watcher
         self.wipe_input = False                                 # the message just typed holds a secret: delete it
 
@@ -1135,6 +1249,39 @@ class App:
             if any(w in str(e).lower() for w in ("blocked", "deactivated", "chat not found")):
                 self.s.d["paused"] = True                                # the user left: stop polling for them until they come back
                 self.s.save()
+
+    def nh_key(self) -> str:
+        """The NumberHub key is the admin's, stored sealed in the bot state: nobody else gets a NumberHub client."""
+        return unseal(self.s.store.d.get("nh_key", "")) if self.is_admin() else ""
+
+    def need_nh(self) -> Reply | None:
+        if not self.is_admin():
+            return "NumberHub is for the admin only.", _nav()
+        return None if self.nh_key() else ("Set the NumberHub key first (admin):\n<code>/nhkey nh_live_...</code>", _nav())
+
+    def client_for(self, o: dict):
+        """The API client for a hunter or a bought number: NumberHub or SmsCenter."""
+        return NumberHub(self.nh_key()) if o.get("prov") == "nh" else self.client_factory()
+
+    def cancel_later(self, id_num: str) -> None:
+        """NumberHub accepts a cancel only ~2 minutes after the number was issued: do it then (the hold is released, no charge)."""
+        async def go():
+            cl = NumberHub(self.nh_key())
+            try:
+                await asyncio.sleep(125)
+                for _ in range(8):
+                    try:
+                        await cl.set_status(id_num, "end")
+                        return
+                    except SmsCenterError as e:
+                        if str(e) != "cancelLocked":
+                            return                                       # already received / ended: nothing to cancel
+                        await asyncio.sleep(30)
+            finally:
+                await cl.close()
+        t = asyncio.create_task(go())
+        self.bg.add(t)
+        t.add_done_callback(self.bg.discard)
 
     def ui_client(self):
         """The client for menu taps: one long-lived connection per API key (the key can change with /setkey)."""
@@ -1648,7 +1795,7 @@ class App:
 
     # -- hunter ---------------------------------------------------------------------------------
     def hunter_title(self, h: dict) -> str:
-        return f"{html.escape(h['sname'])} · {flag(h['cc'])} {html.escape(h['name'])}"
+        return f"{html.escape(h['sname'])} · {fl(h)} {html.escape(h['name'])}"
 
     def hunters_screen(self) -> Reply:
         hs = self.s.d["hunters"]
@@ -1656,8 +1803,10 @@ class App:
                 "It buys numbers for you and tells you each one - with a Release button - and sends the code when it arrives.")
         kb = []
         for hid, h in sorted(hs.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
-            kb.append([(f"{'▶️' if h.get('on') else '⏹'} #{hid} {h['sname'][:10]} {flag(h['cc'])} {h['name'][:12]} · {h['got']}/{h['want']}", f"hu:k:{hid}")])
+            kb.append([(f"{'▶️' if h.get('on') else '⏹'} #{hid}{' NH' if h.get('prov') == 'nh' else ''} {h['sname'][:10]} {fl(h)} {h['name'][:12]} · {h['got']}/{h['want']}", f"hu:k:{hid}")])
         kb.append([("➕ Make hunter", "hu:n:0")])
+        if self.is_admin():
+            kb.append([("➕ Make NumberHub hunter", "hu:nh:0")])
         kb.append([("📜 History", "hi:0"), ("🏠 Menu", "m")])
         return head, kb
 
@@ -1709,6 +1858,8 @@ class App:
         h = self.s.d["hunters"].get(hid)
         if h is None:
             return self.hunters_screen()
+        if h.get("prov") == "nh":
+            return await self.nh_options(hid)
         o = None
         try:
             cl = self.ui_client()
@@ -1728,8 +1879,20 @@ class App:
         return (f"🏹 {self.hunter_title(h)}\nStep 3: pick the price tier you will pay up to.\n"
                 f"<i>Each line = how many numbers cost that price or less (like the website).</i>", kb)
 
-    async def live_prices(self, svc: str, cc: str) -> tuple[str, dict | None]:
-        """The price of this platform in this country from all three endpoints."""
+    async def live_prices(self, svc: str, cc: str, prov: str | None = None) -> tuple[str, dict | None]:
+        """The price of this platform in this country from all three endpoints (NumberHub: its one price + stock)."""
+        if prov == "nh":
+            try:
+                cl = NumberHub(self.nh_key())
+                try:
+                    o = await cl.offer(svc, cc)
+                finally:
+                    await cl.close()
+            except SmsCenterError as e:
+                return f"prices: {html.escape(str(e))}", None
+            if not o:
+                return "Not offered by NumberHub in this country right now.", None
+            return pre([f"{'Price':<16}{usd(o['api']):>9}", f"{'In stock':<16}{('yes' if o['stock'] else 'no'):>9}"]), {"min": o["min"], "api": o["api"], "stock": o["stock"]}
         try:
             cl = self.ui_client()
             try:
@@ -1761,11 +1924,14 @@ class App:
         h = self.s.d["hunters"].get(hid)
         if h is None:
             return self.hunters_screen()
-        prices, snap = await self.live_prices(h["svc"], h["cc"]) if self.s.api_key else ("Set your SmsCenter key first: /setkey", None)
+        nh = h.get("prov") == "nh"
+        have = self.nh_key() if nh else self.s.api_key
+        prices, snap = await self.live_prices(h["svc"], h["cc"], h.get("prov")) if have else (("Set the NumberHub key first: /nhkey" if nh else "Set your SmsCenter key first: /setkey"), None)
         pf = " ".join(filter(None, ["✅ " + ", ".join(h["prefix"]) if h["prefix"] else "", "🚫 " + ", ".join(h["xprefix"]) if h["xprefix"] else ""])) or "any number"
         state = "▶️ <b>hunting</b>" if h.get("on") else "⏹ stopped"
-        txt = (f"🏹 <b>Hunter #{hid}</b> {state}\n{self.hunter_title(h)}\n"
-               f"Bought <b>{h['got']}/{h['want']}</b> · requests {h['tries']} · released {h['rejected']} (prefix / price)\n"
+        txt = (f"🏹 <b>Hunter #{hid}</b> {state}{' · <b>NumberHub</b>' if nh else ''}\n{self.hunter_title(h)}\n"
+               + ("⚠️ NumberHub cancels only ~2 min after a number is issued: numbers that don't match stay held until then (max 50 open per platform + country). With a strict prefix use a slower interval.\n" if nh else "")
+               + f"Bought <b>{h['got']}/{h['want']}</b> · requests {h['tries']} · released {h['rejected']} (prefix / price)\n"
                + ("🔔 stops and tells you if the price changes" if h["stopchg"] else "🔕 keeps hunting when the price changes (follows your max price)")
                + ("\n🛡 checks every number (" + self.checker.describe() + ") - banned / registered ones are cancelled and replaced" if h["check"] else "\n🛡 numbers are not checked")
                + (f"\n<i>{html.escape(h['last'])}</i>" if h.get("last") else "") + f"\n\n<b>Prices now</b>\n{prices}")
@@ -1797,6 +1963,19 @@ class App:
         if sub == "q":
             self.pending[uid] = ("hcsearch", p[2], "")
             return "🔎 <b>Search country</b>\nType a country name or its code (e.g. <code>ua</code>).", [[("⬅️ Countries", f"hu:cp:{p[2]}:0")]]
+        if sub == "nh":                                                  # NumberHub (admin only): platforms -> countries -> hunter
+            return await self.nh_platforms(int(p[2]))
+        if sub == "nhs":
+            return await self.nh_countries(p[2], int(p[3]))
+        if sub == "nhc":
+            return await self.nh_create(p[2], p[3])
+        if sub == "nop":                                                 # hu:nop:<hid>:<operator|->
+            h = hs.get(p[2])
+            if h is None or h.get("prov") != "nh":
+                return self.hunters_screen()
+            h["op"] = None if p[3] == "-" else p[3]
+            self.s.save()
+            return await self.nh_options(p[2])
         if sub == "c":                                                   # country chosen -> create the hunter, ask the operator
             if (r := self.need_key()):
                 return r
@@ -1881,6 +2060,105 @@ class App:
             return self.hunters_screen()
         return self.hunters_screen()
 
+    async def nh_platforms(self, page: int) -> Reply:
+        if (r := self.need_nh()):
+            return r
+        try:
+            cl = NumberHub(self.nh_key())
+            try:
+                svcs = await cl.services()
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"NumberHub error: {html.escape(str(e))}", [[("⬅️ Hunters", "hu:l")]]
+        items = sorted(svcs.items(), key=lambda kv: (kv[0] != DEFAULT_SVC, kv[0]))
+        pages = max(1, (len(items) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        part = items[page * PER_PAGE:(page + 1) * PER_PAGE]
+        kb: KB = [[(f"{c.upper()} · {n[:14]}", f"hu:nhs:{c}:0") for c, n in part[i:i + 2]] for i in range(0, len(part), 2)]
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"hu:nh:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"hu:nh:{page + 1}"))
+        kb += [nav, [("⬅️ Hunters", "hu:l"), ("🏠 Menu", "m")]]
+        return "🏹 <b>Make NumberHub hunter</b>\nStep 1: pick the platform. Step 2: country. Step 3: price, operator, prefix.", kb
+
+    async def nh_countries(self, svc: str, page: int) -> Reply:
+        if (r := self.need_nh()):
+            return r
+        try:
+            cl = NumberHub(self.nh_key())
+            try:
+                cs = sorted(await cl.countries_of(svc), key=lambda c: str(c.get("name") or "").lower())
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"NumberHub error: {html.escape(str(e))}", [[("⬅️ Platforms", "hu:nh:0")]]
+        pages = max(1, (len(cs) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        part = cs[page * PER_PAGE:(page + 1) * PER_PAGE]
+        lab = lambda c: f"{flag(str(c.get('flag') or '').lower())} {str(c.get('name') or c['country'])[:11]} {usd(_num(c.get('price')))}{'' if c.get('in_stock') else ' ⛔'}"   # noqa: E731
+        kb: KB = [[(lab(c), f"hu:nhc:{svc}:{c['country']}") for c in part[i:i + 2]] for i in range(0, len(part), 2)]
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"hu:nhs:{svc}:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"hu:nhs:{svc}:{page + 1}"))
+        kb += [nav, [("⬅️ Platforms", "hu:nh:0"), ("🏠 Menu", "m")]]
+        return f"🏹 <b>{html.escape(svc.upper())}</b> · NumberHub · step 2: pick the country ({len(cs)}; ⛔ = out of stock)", kb
+
+    async def nh_create(self, svc: str, cc: str) -> Reply:
+        if (r := self.need_nh()):
+            return r
+        try:
+            cl = NumberHub(self.nh_key())
+            try:
+                svcs, rows = await cl.services(), await cl.countries_of(svc)
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"NumberHub error: {html.escape(str(e))}", [[("⬅️ Platforms", "hu:nh:0")]]
+        row = next((c for c in rows if str(c["country"]) == cc), None)
+        if row is None:
+            return "NumberHub doesn't offer that country for this platform any more.", [[("⬅️ Platforms", "hu:nh:0")]]
+        hs = self.s.d["hunters"]
+        hid = str(max([int(k) for k in hs if k.isdigit()] or [0]) + 1)
+        h = hs[hid] = new_hunter(hid, svc, svcs.get(svc, svc.upper()), cc, str(row.get("name") or cc))
+        h.update(prov="nh", fl=str(row.get("flag") or "").lower(), interval=max(3.0, float(self.s.d.get("hunt_interval") or 1.0)))
+        self.s.save()
+        return await self.nh_options(hid)
+
+    async def nh_options(self, hid: str) -> Reply:
+        """Step 3 for a NumberHub hunter: its price (tap = max price) and the carriers it may use."""
+        h = self.s.d["hunters"].get(hid)
+        if h is None:
+            return self.hunters_screen()
+        try:
+            cl = NumberHub(self.nh_key())
+            try:
+                o = await cl.offer(h["svc"], h["cc"])
+                try:
+                    ops = await cl.operators(h["cc"], h["svc"])
+                except SmsCenterError:
+                    ops = []
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"NumberHub error: {html.escape(str(e))}", [[("⬅️ Back to the hunter", f"hu:k:{hid}")]]
+        kb: KB = []
+        for pr, q in (o or {}).get("tiers") or []:
+            kb.append([(f"{'✅ ' if h['maxp'] and abs(h['maxp'] - pr) < 1e-9 else ''}Max price = {usd(pr)}" + ("" if q else " (out of stock)"), f"hu:pr:{hid}:{pr:g}")])
+        kb.append([("♾ No price limit", f"hu:pr:{hid}:0")])
+        if ops:
+            kb.append([(("✅ " if not h["op"] else "") + "Any carrier", f"hu:nop:{hid}:-")])
+            kb += [[(("✅ " if h["op"] == x else "") + x[:20], f"hu:nop:{hid}:{x[:40]}") for x in ops[i:i + 2]] for i in range(0, len(ops), 2)]
+        kb.append([("➡️ Continue to the hunter", f"hu:k:{hid}")])
+        return (f"🏹 {self.hunter_title(h)} · NumberHub\nStep 3: the price you will pay up to, and the carrier"
+                + ("" if ops else " (this country assigns the carrier itself)") + ". Prefix, quantity and speed are on the next screen."), kb
+
     def prefix_screen(self, uid: int, hid: str, mode: str = "in") -> Reply:
         """Two lists: ✅ 'only these' (empty = any) and 🚫 'never these'. The next prefix you type is added to the list in `mode`."""
         h = self.s.d["hunters"][hid]
@@ -1929,7 +2207,7 @@ class App:
                 h[key] = [*h[key], *[x for x in add if x not in h[key]]]                  # typing ADDS to the list
         elif field == "hmax":
             if t in ("cheapest", "min", "api"):
-                _txt, snap = await self.live_prices(h["svc"], h["cc"])
+                _txt, snap = await self.live_prices(h["svc"], h["cc"], h.get("prov"))
                 price = (snap or {}).get("api" if t == "api" else "min") or (snap or {}).get("api")
                 if not price:
                     self.pending[uid] = (field, a, "")
@@ -1964,7 +2242,7 @@ class App:
 
     async def start_hunter(self, hid: str) -> Reply:
         h = self.s.d["hunters"][hid]
-        if (r := self.need_key()):
+        if (r := (self.need_nh() if h.get("prov") == "nh" else self.need_key())):
             return r
         if hid in self.hunts and not self.hunts[hid].done():
             return await self.hunter_card(hid)
@@ -1998,7 +2276,7 @@ class App:
         is released straight away; a matching one is kept and announced. Ends when it has `want` matching numbers, the time is up, or a real
         problem (no balance, bad key...) appears."""
         h = self.s.d["hunters"][hid]
-        client = self.client_factory()
+        client = self.client_for(h)
         end = time.time() + h["minutes"] * 60
         why, errs, stuck = "", 0, 0
         h["stuck_n"] = 0
@@ -2110,7 +2388,7 @@ class App:
         self.hunts.pop(hid, None)
         self.s.save()
         if h["got"] >= h["want"]:
-            await self.notify(f"🏁 <b>Hunter #{hid}</b> finished: bought <b>{h['got']}/{h['want']}</b> {html.escape(h['sname'])} numbers ({flag(h['cc'])} {html.escape(h['name'])}).\n"
+            await self.notify(f"🏁 <b>Hunter #{hid}</b> finished: bought <b>{h['got']}/{h['want']}</b> {html.escape(h['sname'])} numbers ({fl(h)} {html.escape(h['name'])}).\n"
                               f"{h['tries']} requests · {h['rejected']} numbers released (prefix / price).")
         else:
             await self.notify(f"⏹ <b>Hunter #{hid}</b> stopped: {html.escape(why)}\nBought {h['got']}/{h['want']} · {h['tries']} requests · {h['rejected']} released.")
@@ -2121,14 +2399,17 @@ class App:
                 if await client.set_status(id_num, "end") in ("ready", "update"):
                     return True
                 return False                                             # smsReceived / waitSms: too late
-            except SmsCenterError:
+            except SmsCenterError as err:
+                if str(err) == "cancelLocked":                           # NumberHub: too early to cancel - it is done automatically in ~2 min
+                    self.cancel_later(id_num)
+                    return True
                 await asyncio.sleep(0.2)
         return False
 
     # -- bought numbers: history, code, release
     def record_purchase(self, h: dict, num: dict, state: str = "active") -> dict:
         e = {"t": time.time(), "hid": h["id"], "svc": h["svc"], "sname": h["sname"], "cc": h["cc"], "name": h["name"], "op": h["op"] or "any",
-             "tel": num["tel"], "idNum": num["idNum"], "price": num["price"], "code": None, "state": state}
+             "tel": num["tel"], "idNum": num["idNum"], "price": num["price"], "code": None, "state": state, "prov": h.get("prov") or "sc", "fl": h.get("fl")}
         hist = self.s.d["history"]
         hist.insert(0, e)
         del hist[HIST_KEEP:]
@@ -2154,7 +2435,7 @@ class App:
                 e["chk"], e["chk_note"] = "unknown", "the checker bot didn't answer in time"
             if e["chk"] in ("banned", "registered") and e["state"] == "active":
                 e["releasing"] = True
-                client = self.client_factory()
+                client = self.client_for(e)
                 try:
                     ok = await self.release_quiet(client, e["idNum"])
                 finally:
@@ -2189,7 +2470,7 @@ class App:
     def code_card(self, e: dict) -> Reply:
         chk = {"clean": "🟢 Clean", "banned": "🔴 Banned", "registered": "🟠 Registered", "pending": "🔎 Checking…"}.get(e.get("chk", "off"), "⚪ Not checked")
         return (f"📩 <b>Code</b>  <code>{html.escape(e['code'] or '')}</code>\n📞 <code>+{html.escape(e['tel'])}</code>\n"
-                f"{chk} · {flag(e['cc'])} {html.escape(e['name'])} · {html.escape(e['sname'])}",
+                f"{chk} · {fl(e)} {html.escape(e['name'])} · {html.escape(e['sname'])}",
                 [[("📋 Copy code", f"copy:{e['code']}"), ("📋 Copy number", f"copy:+{e['tel']}")]])
 
     async def refresh_code_msg(self, e: dict) -> None:
@@ -2214,7 +2495,7 @@ class App:
         elif st == "kept":
             head = "⚠️ <b>Could not be cancelled</b> - it is yours"
         elif st == "cancelled":
-            head = "🚫 <b>Ended on SmsCenter</b>"
+            head = f"🚫 <b>Ended on {pn(e)}</b>"
         elif chk in ("banned", "registered"):
             head = "❌ <b>Rejected</b>"
         elif st == "code":
@@ -2224,7 +2505,7 @@ class App:
         else:
             head = "✅ <b>Number ready</b>"
         lines = [head, f"📞 <code>+{html.escape(e['tel'])}</code>",
-                 f"{flag(e['cc'])} {html.escape(e['name'])} · {html.escape(e['sname'])}" + (f" · {usd(e['price'])}" if e.get("price") else "")
+                 f"{fl(e)} {html.escape(e['name'])} · {html.escape(e['sname'])}" + (f" · {usd(e['price'])}" if e.get("price") else "")
                  + (f" · hunter #{e['hid']}" if e.get("hid") else ""), chk_line]
         if st == "active":
             lines.append("⏳ Waiting for the code…" if chk not in ("banned", "registered") else "")
@@ -2233,7 +2514,7 @@ class App:
         elif st == "expired":
             lines.append("⌛ No code arrived - expired")
         elif st == "cancelled":
-            lines.append(f"🚫 SmsCenter ended it after {mmss(e.get('ended_after') or 0)} - it <b>timed out</b>, or it was <b>cancelled from the panel</b>. No code.")
+            lines.append(f"🚫 {pn(e)} ended it after {mmss(e.get('ended_after') or 0)} - it <b>timed out</b>, or it was <b>cancelled from the panel</b>. No code.")
         kb: KB = [[("📋 Copy number", f"copy:+{e['tel']}")]]
         if st == "code" and e.get("code"):
             kb[0].append(("📋 Copy code", f"copy:{e['code']}"))
@@ -2248,7 +2529,7 @@ class App:
         """Watch one bought number until its code arrives (-> a reply under the number's message), or SmsCenter ends it (timed out / cancelled in
         the panel -> the card says so and is unpinned). Uses the v0 getStatus, which is the only call that tells 'cancelled' from 'waiting'."""
         e = self.find_purchase(id_num)
-        client = self.client_factory()
+        client = self.client_for(e) if e else self.client_factory()
         end = max((e["t"] if e else time.time()) + CODE_WAIT, time.time() + 30)
         try:
             while e and e["state"] == "active" and time.time() < end:
@@ -2276,7 +2557,7 @@ class App:
                         e["pinned"] = False
                         await self.unpin_msg(e.get("mid"))
                     await self.refresh_card(e)
-                    await self.notify_kb(f"🚫 <b>+{html.escape(e['tel'])}</b> ended on SmsCenter after {mmss(e['ended_after'])} - it timed out or was cancelled from the panel.",
+                    await self.notify_kb(f"🚫 <b>+{html.escape(e['tel'])}</b> ended on {pn(e)} after {mmss(e['ended_after'])} - it timed out or was cancelled from the panel.",
                                          None, reply_to=e.get("mid"))
                     return
                 await asyncio.sleep(CODE_POLL)
@@ -2450,7 +2731,7 @@ class App:
         for e in self.s.d["history"]:
             if e.get("chk") == "pending":
                 e["chk"], e["chk_note"] = "unknown", "the bot restarted before the check finished"
-            if e["state"] == "active" and e["idNum"] not in self.code_tasks and self.s.api_key:
+            if e["state"] == "active" and e["idNum"] not in self.code_tasks and (self.s.api_key or e.get("prov") == "nh"):
                 self.code_tasks[e["idNum"]] = asyncio.create_task(self.wait_code(e["idNum"]))
 
     async def release(self, id_num: str) -> Reply:
@@ -2459,13 +2740,16 @@ class App:
             return "I don't know that number any more.", _nav(("📜 History", "hi:0"))
         if e["state"] in ("released", "code", "kept", "expired", "cancelled"):
             return self.purchase_card(e)
-        client = self.client_factory()
+        client = self.client_for(e)
         e["releasing"] = True
         try:
             try:
                 st = await client.set_status(id_num, "end")
             except SmsCenterError as err:
                 txt, kb = self.purchase_card(e)
+                if str(err) == "cancelLocked":
+                    self.cancel_later(id_num)
+                    return txt + "\n⏳ NumberHub accepts a cancel only ~2 minutes after the number is issued. I will cancel it automatically then (no charge).", kb[:1]
                 return txt + f"\n⚠️ Couldn't cancel: {html.escape(str(err))}", [*kb[:1], [("🔓 Try again", f"rl:{id_num}")]]
         finally:
             e.pop("releasing", None)
@@ -2499,9 +2783,9 @@ class App:
         icon = {"active": "🟡", "code": "🟢", "released": "🔓", "expired": "⌛", "kept": "⚠️", "cancelled": "🚫"}
         lines = []
         for e in part:
-            what = f"code {e['code']}" if e["state"] == "code" else {"active": "waiting for the code", "released": "released", "expired": "no code - expired", "kept": "kept (couldn't release)", "cancelled": "ended on SmsCenter (timeout / panel)"}[e["state"]]
+            what = f"code {e['code']}" if e["state"] == "code" else {"active": "waiting for the code", "released": "released", "expired": "no code - expired", "kept": "kept (couldn't release)", "cancelled": f"ended on {pn(e)} (timeout / panel)"}[e["state"]]
             ck = {"clean": "🟢", "banned": "🔴", "registered": "🟠"}.get(e.get("chk", "off"), "⚪")
-            lines.append(f"{icon[e['state']]}{ck} {time.strftime('%d %b %H:%M', time.localtime(e['t']))} · +{e['tel']} · {e['sname']} {flag(e['cc'])} · {usd(e['price'])} · {what}")
+            lines.append(f"{icon[e['state']]}{ck} {time.strftime('%d %b %H:%M', time.localtime(e['t']))} · +{e['tel']} · {e['sname']} {fl(e)} · {usd(e['price'])} · {what}")
         kb: KB = [[(f"🔓 Release +{e['tel']}", f"rl:{e['idNum']}")] for e in part if e["state"] == "active"]
         nav = []
         if page > 0:
@@ -3019,7 +3303,7 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr", "/sessionuser"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr", "/sessionuser", "/nhkey"}
 LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
 SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
@@ -3171,9 +3455,9 @@ class Hub:
             return "You can only use /session (it creates the number-checker's Telegram session).", None
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
-        if cmd in ("/session", "/proxies", "/sessionstr", "/sessionuser") and uid != d["admin"]:
+        if cmd in ("/session", "/proxies", "/sessionstr", "/sessionuser", "/nhkey") and uid != d["admin"]:
             return "Only the admin can do that.", None
-        if cmd in ("/proxies", "/sessionstr"):
+        if cmd in ("/proxies", "/sessionstr", "/nhkey"):
             self.set_wipe(uid, True)                                     # the list holds passwords: delete the message
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
@@ -3339,6 +3623,22 @@ class Hub:
             await self.login_drop(uid)
             self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
+
+    async def nh_key_cmd(self, key: str) -> Reply:
+        """/nhkey nh_live_... : the NumberHub API key (admin only, stored sealed, the message is deleted)."""
+        d = self.store.d
+        if not key:
+            return ("NumberHub key is set. " if d.get("nh_key") else "No NumberHub key yet. ") + "Send <code>/nhkey nh_live_...</code> to set it (I delete your message).", _nav()
+        cl = NumberHub(key)
+        try:
+            bal = await cl.balance()
+        except SmsCenterError as e:
+            return f"❌ NumberHub didn't accept that key ({html.escape(str(e))}). Nothing was changed.", _nav()
+        finally:
+            await cl.close()
+        self.store.set_secret("nh_key", key)
+        return (f"✅ NumberHub key saved (your message is deleted). Available balance: {usd(bal)}.\n"
+                "Make a hunter: 🏹 Hunter → ➕ Make NumberHub hunter."), _nav(("🏹 Hunter", "hu:l"))
 
     def session_users_cmd(self, arg: str) -> Reply:
         """/sessionuser @name|id adds a session-only user, /sessionuser remove @name|id removes one, /sessionuser lists."""
@@ -3584,6 +3884,8 @@ class Hub:
             return await self.session_from_string(arg.strip())
         if cmd == "/sessionuser":
             return self.session_users_cmd(arg.strip())
+        if cmd == "/nhkey":
+            return await self.nh_key_cmd(arg.strip())
         if cmd == "/proxies":
             from tgbot_checker import proxies
             if arg.strip().lower() == "clear":
