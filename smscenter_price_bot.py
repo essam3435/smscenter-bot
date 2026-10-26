@@ -1221,7 +1221,7 @@ class App:
             "/set [platform] &lt;country&gt; under 1.20 | off\n/set [platform] &lt;country&gt; every 10 (seconds) | default\n"
             "/trend [platform] &lt;country&gt; · /interval &lt;sec&gt; (default) · /drop &lt;%&gt; (default) · /mute &lt;min|off&gt;\n"
             "/watch [platform] &lt;price&gt; - tell me every country under that price, then only the changes · /watches · /unwatch &lt;id|all&gt;\n"
-            "/hunter - buy numbers with a hunter (prefix, max price, how many, how often) · /history\n/setkey &lt;apikey&gt; · /check · /pause (monitoring only) · /resume · /status\nOr just type a country or platform name to find it.")
+            "/hunter - buy numbers with a hunter (prefix, max price, how many, how often) · /history\n/setkey &lt;apikey&gt; · /nhkey &lt;NumberHub key&gt; (hunt on NumberHub with your own wallet) · /check · /pause (monitoring only) · /resume · /status\nOr just type a country or platform name to find it.")
 
     def __init__(self, state: UserState, bot=None, uid: int = 0, client_factory=None):
         self.s, self.bot, self.uid = state, bot, uid
@@ -1251,13 +1251,12 @@ class App:
                 self.s.save()
 
     def nh_key(self) -> str:
-        """The NumberHub key is the admin's, stored sealed in the bot state: nobody else gets a NumberHub client."""
-        return unseal(self.s.store.d.get("nh_key", "")) if self.is_admin() else ""
+        """This user's own NumberHub key (sealed in their profile, like the SmsCenter key). The admin's key from the first version (bot-wide) still counts for the admin."""
+        k = unseal(self.s.d.get("nh_key", ""))
+        return k or (unseal(self.s.store.d.get("nh_key", "")) if self.is_admin() else "")
 
     def need_nh(self) -> Reply | None:
-        if not self.is_admin():
-            return "NumberHub is for the admin only.", _nav()
-        return None if self.nh_key() else ("Set the NumberHub key first (admin):\n<code>/nhkey nh_live_...</code>", _nav())
+        return None if self.nh_key() else ("Set your NumberHub API key first:\n<code>/nhkey YOUR_KEY</code>", _nav())
 
     def client_for(self, o: dict):
         """The API client for a hunter or a bought number: NumberHub or SmsCenter."""
@@ -1449,7 +1448,7 @@ class App:
         age = "never" if not s["last_poll"] else f"{int(time.time() - s['last_poll'])}s ago"
         txt = (f"<b>SmsCenter · price tracker</b>  {status}{mute}\n{self.n_on()} tracking now · {len(s['tracks'])} saved\n"
                f"Endpoints: {', '.join(ENDPOINTS[e] for e in self.s.endpoints)}\nDefault check every {secs(s['interval'])} · last poll {age}\n"
-               f"API key: {'set ✅' if self.s.api_key else 'NOT SET ❗ /setkey'}")
+               f"API key: {'set ✅' if self.s.api_key else 'NOT SET ❗ /setkey'}\nNumberHub key: {'set ✅' if self.nh_key() else 'not set (/nhkey)'}")
         nw = sum(1 for w in s["watches"].values() if w.get("on"))
         nh = sum(1 for h in s["hunters"].values() if h.get("on"))
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
@@ -1805,8 +1804,7 @@ class App:
         for hid, h in sorted(hs.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
             kb.append([(f"{'▶️' if h.get('on') else '⏹'} #{hid}{' NH' if h.get('prov') == 'nh' else ''} {h['sname'][:10]} {fl(h)} {h['name'][:12]} · {h['got']}/{h['want']}", f"hu:k:{hid}")])
         kb.append([("➕ Make hunter", "hu:n:0")])
-        if self.is_admin():
-            kb.append([("➕ Make NumberHub hunter", "hu:nh:0")])
+        kb.append([("➕ Make NumberHub hunter", "hu:nh:0")])
         kb.append([("📜 History", "hi:0"), ("🏠 Menu", "m")])
         return head, kb
 
@@ -3189,6 +3187,22 @@ class App:
         self.tracker.poke()
         return "API key saved (I deleted your message). Now pick a platform 👇", [[("📱 Platforms", "pl:0")], [("🏠 Menu", "m")]]
 
+    async def cmd_nhkey(self, arg: str) -> Reply:
+        """/nhkey <key>: this user's own NumberHub key (validated with /balance, stored sealed, the message is deleted)."""
+        self.wipe_input = True                                           # the key must not stay in the chat, even when it is refused
+        k = arg.strip()
+        if not k:
+            return ("NumberHub key: set ✅" if self.nh_key() else "NumberHub key: not set ❗") + "\nUsage: <code>/nhkey nh_live_...</code> (your own key from numberhub.io → API). I delete your message.", _nav()
+        cl = NumberHub(k)
+        try:
+            bal = await cl.balance()
+        except SmsCenterError as e:
+            return f"❌ NumberHub didn't accept that key ({html.escape(str(e))}). Nothing was changed.", _nav()
+        finally:
+            await cl.close()
+        self.s.set_secret("nh_key", k)
+        return f"✅ NumberHub key saved (your message is deleted). Available balance: {usd(bal)}.\nMake a hunter: 🏹 Hunter → ➕ Make NumberHub hunter.", _nav(("🏹 Hunter", "hu:l"))
+
     async def cmd_status(self, arg: str = "") -> Reply:
         return self.main_screen()
 
@@ -3303,7 +3317,7 @@ class App:
             return f"Something went wrong: {html.escape(type(e).__name__)}", _nav()
 
 
-ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr", "/sessionuser", "/nhkey"}
+ADMIN_CMDS = {"/access", "/allow", "/deny", "/users", "/session", "/proxies", "/sessionstr", "/sessionuser"}
 LOGIN_TTL = 300                                                          # a half-finished Telethon login is forgotten after this many seconds
 SESSION_BASE = os.path.join(HERE, "gh_checker")                          # -> gh_checker.session
 
@@ -3455,9 +3469,9 @@ class Hub:
             return "You can only use /session (it creates the number-checker's Telegram session).", None
         if not self.allowed(uid):
             return f"This bot is private. Ask the admin to allow your ID: <code>{uid}</code>", None
-        if cmd in ("/session", "/proxies", "/sessionstr", "/sessionuser", "/nhkey") and uid != d["admin"]:
+        if cmd in ("/session", "/proxies", "/sessionstr", "/sessionuser") and uid != d["admin"]:
             return "Only the admin can do that.", None
-        if cmd in ("/proxies", "/sessionstr", "/nhkey"):
+        if cmd in ("/proxies", "/sessionstr"):
             self.set_wipe(uid, True)                                     # the list holds passwords: delete the message
         if uid == d["admin"] and cmd in ADMIN_CMDS:
             return await self.admin(cmd, arg)
@@ -3623,22 +3637,6 @@ class Hub:
             await self.login_drop(uid)
             self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
-
-    async def nh_key_cmd(self, key: str) -> Reply:
-        """/nhkey nh_live_... : the NumberHub API key (admin only, stored sealed, the message is deleted)."""
-        d = self.store.d
-        if not key:
-            return ("NumberHub key is set. " if d.get("nh_key") else "No NumberHub key yet. ") + "Send <code>/nhkey nh_live_...</code> to set it (I delete your message).", _nav()
-        cl = NumberHub(key)
-        try:
-            bal = await cl.balance()
-        except SmsCenterError as e:
-            return f"❌ NumberHub didn't accept that key ({html.escape(str(e))}). Nothing was changed.", _nav()
-        finally:
-            await cl.close()
-        self.store.set_secret("nh_key", key)
-        return (f"✅ NumberHub key saved (your message is deleted). Available balance: {usd(bal)}.\n"
-                "Make a hunter: 🏹 Hunter → ➕ Make NumberHub hunter."), _nav(("🏹 Hunter", "hu:l"))
 
     def session_users_cmd(self, arg: str) -> Reply:
         """/sessionuser @name|id adds a session-only user, /sessionuser remove @name|id removes one, /sessionuser lists."""
@@ -3884,8 +3882,6 @@ class Hub:
             return await self.session_from_string(arg.strip())
         if cmd == "/sessionuser":
             return self.session_users_cmd(arg.strip())
-        if cmd == "/nhkey":
-            return await self.nh_key_cmd(arg.strip())
         if cmd == "/proxies":
             from tgbot_checker import proxies
             if arg.strip().lower() == "clear":
