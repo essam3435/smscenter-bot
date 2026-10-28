@@ -1516,8 +1516,8 @@ class App:
               [("📋 Tracked", "t:l")],
               [("⚙️ Settings", "s:m"), ("📜 History", "hi:0")],
               [("▶️ Resume monitoring" if s["paused"] else "⏸ Pause monitoring", "s:pause"), ("🔄 Check now", "k")]]
-        if self.is_admin():
-            kb.append([("🛠 Admin", "ad:m")])
+        if self.is_admin():                                              # quick row, admin only: the same buttons as the admin panel
+            kb.append([("👥 Users", "ad:u:0"), ("📩 Codes", "ad:c:0"), ("🛠 Admin", "ad:m")])
         return txt, kb
 
     async def platforms_screen(self, page: int) -> Reply:
