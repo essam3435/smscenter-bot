@@ -1513,10 +1513,9 @@ class App:
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
         txt += "\n<i>⏸ Pause only stops the price monitoring - hunters keep hunting.</i>"
         sites = [prov for prov, _, _ in WEB_SITES if self.site_ok(prov)]
-        kb = [[(f"🔑 API keys ({sum(1 for pv in sites if self.site_key(pv))}/{len(sites)} set)", "web:l")],       # opens the list: one full-width button per API
-              [("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
+        kb = [[("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
               [("📧 Email", "em:m"), ("📱 Platforms", "pl:0")],
-              [("📋 Tracked", "t:l")],
+              [("📋 Tracked", "t:l"), (f"🔑 API keys {sum(1 for pv in sites if self.site_key(pv))}/{len(sites)}", "web:l")],      # small button beside Tracked: opens the list of APIs
               [("⚙️ Settings", "s:m"), ("📜 History", "hi:0")],
               [("▶️ Resume monitoring" if s["paused"] else "⏸ Pause monitoring", "s:pause"), ("🔄 Check now", "k")]]
         if self.is_admin():                                              # quick row, admin only: the same buttons as the admin panel
