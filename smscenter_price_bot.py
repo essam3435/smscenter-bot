@@ -1507,12 +1507,12 @@ class App:
         age = "never" if not s["last_poll"] else f"{int(time.time() - s['last_poll'])}s ago"
         txt = (f"<b>SmsCenter · price tracker</b>  {status}{mute}\n{self.n_on()} tracking now · {len(s['tracks'])} saved\n"
                f"Endpoints: {', '.join(ENDPOINTS[e] for e in self.s.endpoints)}\nDefault check every {secs(s['interval'])} · last poll {age}\n"
-               + "\n".join(f"{name} API: {'set ✅' if self.site_key(prov) else 'NOT SET ❗'}" for prov, name, _ in WEB_SITES if self.site_ok(prov)))
+               + "\n".join((f"{name} API: {'set ✅' if self.site_key(prov) else 'NOT SET ❗'}" if PROV_READY[prov] else f"{name} API: ⏳ not connected yet" + (" (key saved)" if self.site_key(prov) else "")) for prov, name, _ in WEB_SITES if self.site_ok(prov)))
         nw = sum(1 for w in s["watches"].values() if w.get("on"))
         nh = sum(1 for h in s["hunters"].values() if h.get("on"))
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
         txt += "\n<i>⏸ Pause only stops the price monitoring - hunters keep hunting.</i>"
-        sites = [prov for prov, _, _ in WEB_SITES if self.site_ok(prov)]
+        sites = [prov for prov, _, _ in WEB_SITES if self.site_ok(prov) and PROV_READY[prov]]
         kb = [[("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
               [("📧 Email", "em:m"), ("📱 Platforms", "pl:0")],
               [("📋 Tracked", "t:l"), (f"🔑 API keys {sum(1 for pv in sites if self.site_key(pv))}/{len(sites)}", "web:l")],      # small button beside Tracked: opens the list of APIs
@@ -3318,6 +3318,7 @@ class App:
             bal = "n/a (not connected yet)"
         txt = (f"🔑 <b>{name} API</b>{'' if PROV_READY[prov] else ' <i>(not connected yet)</i>'}\n"
                + (f"Key: set ✅ (…{html.escape(key[-4:])})\n💰 Balance: {bal}" if key else "Key: not set ❗")
+               + ("" if PROV_READY[prov] else "\n⚠️ <b>Not connected yet</b>: there is no hunter for it and nothing is bought. The key is only saved for later.")
                + (f"\n\n{note}" if note else ""))
         kb: KB = [[("🔄 Update key" if key else "🔑 Set key", f"web:k:{prov}")]]
         if key:
@@ -3331,8 +3332,9 @@ class App:
 
     def websites_screen(self) -> Reply:
         sites = [(prov, name) for prov, name, _ in WEB_SITES if self.site_ok(prov)]
-        lines = [f"{'✅' if self.site_key(prov) else '❌'} {name} API" + ("" if PROV_READY[prov] else " (soon)") for prov, name in sites]
-        kb: KB = [[(f"{'✅' if self.site_key(prov) else '❌'} {name} API", f"web:p:{prov}")] for prov, name in sites]
+        mark = lambda prov: ("✅" if self.site_key(prov) else "❌") if PROV_READY[prov] else "⏳"   # noqa: E731  (⏳ = not connected: nothing to work yet)
+        lines = [f"{mark(prov)} {name} API" + ("" if PROV_READY[prov] else " - not connected yet, no hunter") for prov, name in sites]
+        kb: KB = [[(f"{mark(prov)} {name} API" + ("" if PROV_READY[prov] else " (soon)"), f"web:p:{prov}")] for prov, name in sites]
         kb.append([("🏠 Menu", "m")])
         return "🔑 <b>API keys</b> - tap one to set, update or remove it\n" + "\n".join(lines), kb
 
