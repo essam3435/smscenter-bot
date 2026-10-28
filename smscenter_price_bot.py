@@ -1507,14 +1507,15 @@ class App:
         age = "never" if not s["last_poll"] else f"{int(time.time() - s['last_poll'])}s ago"
         txt = (f"<b>SmsCenter · price tracker</b>  {status}{mute}\n{self.n_on()} tracking now · {len(s['tracks'])} saved\n"
                f"Endpoints: {', '.join(ENDPOINTS[e] for e in self.s.endpoints)}\nDefault check every {secs(s['interval'])} · last poll {age}\n"
-               + "\n".join(f"{name} key: {'set ✅' if self.site_key(prov) else 'NOT SET ❗'}" for prov, name, _ in WEB_SITES if self.site_ok(prov)))
+               + "\n".join(f"{name} API: {'set ✅' if self.site_key(prov) else 'NOT SET ❗'}" for prov, name, _ in WEB_SITES if self.site_ok(prov)))
         nw = sum(1 for w in s["watches"].values() if w.get("on"))
         nh = sum(1 for h in s["hunters"].values() if h.get("on"))
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
         txt += "\n<i>⏸ Pause only stops the price monitoring - hunters keep hunting.</i>"
-        kb = [[("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
+        kb = [[(f"{'✅' if self.site_key(prov) else '❌'} {name} API", f"web:p:{prov}") for prov, name, _ in WEB_SITES if self.site_ok(prov)],   # tap = set / update / remove that API key
+              [("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
               [("📧 Email", "em:m"), ("📱 Platforms", "pl:0")],
-              [("📋 Tracked", "t:l"), ("🌐 Websites", "web:l")],
+              [("📋 Tracked", "t:l")],
               [("⚙️ Settings", "s:m"), ("📜 History", "hi:0")],
               [("▶️ Resume monitoring" if s["paused"] else "⏸ Pause monitoring", "s:pause"), ("🔄 Check now", "k")]]
         if self.is_admin():                                              # quick row, admin only: the same buttons as the admin panel
@@ -3313,8 +3314,8 @@ class App:
                 await cl.close()
         elif key:
             bal = "n/a (not connected yet)"
-        txt = (f"🌐 <b>{name}</b>{'' if PROV_READY[prov] else ' <i>(not connected yet)</i>'}\n"
-               + (f"🔑 Key: set ✅ (…{html.escape(key[-4:])})\n💰 Balance: {bal}" if key else "🔑 Key: not set ❗")
+        txt = (f"🔑 <b>{name} API</b>{'' if PROV_READY[prov] else ' <i>(not connected yet)</i>'}\n"
+               + (f"Key: set ✅ (…{html.escape(key[-4:])})\n💰 Balance: {bal}" if key else "Key: not set ❗")
                + (f"\n\n{note}" if note else ""))
         kb: KB = [[("🔄 Update key" if key else "🔑 Set key", f"web:k:{prov}")]]
         if key:
@@ -3323,15 +3324,15 @@ class App:
             kb.append([("🏹 Make hunter", "hu:n:0"), ("📱 Platforms", "pl:0")])
         elif prov == "nh":
             kb.append([("🏹 Make hunter", "hu:nh:0"), ("🏹 My hunters", "hu:l")])
-        kb.append([("⬅️ Websites", "web:l"), ("🏠 Menu", "m")])
+        kb.append([("🏠 Menu", "m")])
         return txt, kb
 
     def websites_screen(self) -> Reply:
         sites = [(prov, name) for prov, name, _ in WEB_SITES if self.site_ok(prov)]
-        lines = [f"{'✅' if self.site_key(prov) else '❌'} {name}" + ("" if PROV_READY[prov] else " (soon)") for prov, name in sites]
-        kb: KB = [[(f"{'✅' if self.site_key(prov) else '❌'} {name}", f"web:p:{prov}")] for prov, name in sites]
+        lines = [f"{'✅' if self.site_key(prov) else '❌'} {name} API" + ("" if PROV_READY[prov] else " (soon)") for prov, name in sites]
+        kb: KB = [[(f"{'✅' if self.site_key(prov) else '❌'} {name} API", f"web:p:{prov}")] for prov, name in sites]
         kb.append([("🏠 Menu", "m")])
-        return "🌐 <b>Websites</b> - tap one to set, update or remove your key\n" + "\n".join(lines), kb
+        return "🔑 <b>API keys</b> - tap one to set, update or remove it\n" + "\n".join(lines), kb
 
     async def ui_web(self, uid: int, p: list[str]) -> Reply | None:
         sub, prov = (p[1] if len(p) > 1 else "l"), (p[2] if len(p) > 2 else "")
@@ -3341,7 +3342,7 @@ class App:
             return await self.website_card(prov)
         if sub == "k":
             self.pending[uid] = ("webkey", prov, "")
-            return (f"🔑 <b>{PROV_NAME[prov]} key</b>\nSend your {PROV_NAME[prov]} API key as a message. I check it and delete your message right after."), [[("Cancel", f"web:p:{prov}")]]
+            return (f"🔑 <b>{PROV_NAME[prov]} API</b>\nSend your {PROV_NAME[prov]} API key as a message. I check it and delete your message right after."), [[("Cancel", f"web:p:{prov}")]]
         if sub == "rm":
             return f"Remove your <b>{PROV_NAME[prov]}</b> key? Your hunters on it will stop working until you set a key again.", [[("✅ Yes, remove", f"web:rmy:{prov}"), ("Cancel", f"web:p:{prov}")]]
         if sub == "rmy":
