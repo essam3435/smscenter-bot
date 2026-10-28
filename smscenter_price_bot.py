@@ -1512,7 +1512,8 @@ class App:
         nh = sum(1 for h in s["hunters"].values() if h.get("on"))
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
         txt += "\n<i>⏸ Pause only stops the price monitoring - hunters keep hunting.</i>"
-        kb = [[(f"{'✅' if self.site_key(prov) else '❌'} {name} API", f"web:p:{prov}") for prov, name, _ in WEB_SITES if self.site_ok(prov)],   # tap = set / update / remove that API key
+        sites = [prov for prov, _, _ in WEB_SITES if self.site_ok(prov)]
+        kb = [[(f"🔑 API keys ({sum(1 for pv in sites if self.site_key(pv))}/{len(sites)} set)", "web:l")],       # opens the list: one full-width button per API
               [("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
               [("📧 Email", "em:m"), ("📱 Platforms", "pl:0")],
               [("📋 Tracked", "t:l")],
