@@ -196,7 +196,8 @@ def flag(code: str) -> str:
 
 PROV_NAME = {"sc": "SmsCenter", "nh": "NumberHub", "pv": "PVAPins"}
 PROV_DEFAULT = {"nh": "all", "pv": "list"}               # who may use a provider: "all" users, or "list" = the admin + the listed ids (PVAPins starts admin-only)
-PROV_READY = {"nh": True, "pv": False}
+PROV_READY = {"sc": True, "nh": True, "pv": False}
+WEB_SITES = (("sc", "SmsCenter", "api_key"), ("nh", "NumberHub", "nh_key"), ("pv", "PVAPins", "pv_key"))   # (provider, name, profile field of its sealed key)
 
 
 def ago(t: float) -> str:
@@ -1506,14 +1507,14 @@ class App:
         age = "never" if not s["last_poll"] else f"{int(time.time() - s['last_poll'])}s ago"
         txt = (f"<b>SmsCenter · price tracker</b>  {status}{mute}\n{self.n_on()} tracking now · {len(s['tracks'])} saved\n"
                f"Endpoints: {', '.join(ENDPOINTS[e] for e in self.s.endpoints)}\nDefault check every {secs(s['interval'])} · last poll {age}\n"
-               f"API key: {'set ✅' if self.s.api_key else 'NOT SET ❗ /setkey'}\nNumberHub key: {'set ✅' if self.nh_key() else 'not set (/nhkey)'}")
+               + "\n".join(f"{name} key: {'set ✅' if self.site_key(prov) else 'NOT SET ❗'}" for prov, name, _ in WEB_SITES if self.site_ok(prov)))
         nw = sum(1 for w in s["watches"].values() if w.get("on"))
         nh = sum(1 for h in s["hunters"].values() if h.get("on"))
         txt += f"\n🎯 {nw} price watch{'es' if nw != 1 else ''} running · 🏹 {nh} hunter{'s' if nh != 1 else ''} hunting"
         txt += "\n<i>⏸ Pause only stops the price monitoring - hunters keep hunting.</i>"
         kb = [[("🏹 Hunter", "hu:l"), ("🎯 Price watch", "pw:l")],
               [("📧 Email", "em:m"), ("📱 Platforms", "pl:0")],
-              [("📋 Tracked", "t:l")],
+              [("📋 Tracked", "t:l"), ("🌐 Websites", "web:l")],
               [("⚙️ Settings", "s:m"), ("📜 History", "hi:0")],
               [("▶️ Resume monitoring" if s["paused"] else "⏸ Pause monitoring", "s:pause"), ("🔄 Check now", "k")]]
         if self.is_admin():                                              # quick row, admin only: the same buttons as the admin panel
@@ -1678,6 +1679,8 @@ class App:
             return None
         if k == "hu":
             return await self.ui_hunt(uid, p)
+        if k == "web":
+            return await self.ui_web(uid, p)
         if k == "em":
             return await self.ui_email(uid, p)
         if k == "rl":
@@ -1804,6 +1807,8 @@ class App:
         field, svc, cc = self.pending.pop(uid)
         if field in ("emdomain", "emgmail", "empass"):
             return await self.take_email_value(field, text)
+        if field == "webkey":
+            return await self.take_web_key(uid, svc, text)
         if field in ("hcsearch", "hprefix", "hxprefix", "hmax", "hint", "hmin"):
             return await self.take_hunt_value(uid, field, svc, text)
         if field in ("wprice", "wlimit", "wint", "wstock"):
@@ -3255,6 +3260,107 @@ class App:
         self.tracker.poke()
         return "API key saved (I deleted your message). Now pick a platform 👇", [[("📱 Platforms", "pl:0")], [("🏠 Menu", "m")]]
 
+    # -- 🌐 Websites: every user sees the sites they may use, and sets / updates / removes the key of each
+    def site_ok(self, prov: str) -> bool:
+        return prov == "sc" or self.s.store.prov_ok(self.uid, prov)
+
+    def site_key(self, prov: str) -> str:
+        if not self.site_ok(prov):
+            return ""
+        return {"sc": lambda: self.s.api_key, "nh": self.nh_key, "pv": lambda: unseal(self.s.d.get("pv_key", ""))}[prov]()
+
+    async def save_key(self, prov: str, key: str) -> tuple[str | None, str]:
+        """-> (error or None, info). SmsCenter / NumberHub keys are tested against the site; PVAPins has no integration yet, so its key is only stored."""
+        key = key.strip()
+        if len(key) < 8 or " " in key:
+            return "That doesn't look like an API key.", ""
+        info = ""
+        if prov == "sc":
+            bal = await check_key(key)
+            if bal is None:
+                return "SmsCenter rejected that key (or could not be reached).", ""
+            info = f"Balance {usd(bal)}."
+            self._countries, self._services = [], None
+        elif prov == "nh":
+            cl = NumberHub(key)
+            try:
+                info = f"Available balance {usd(await cl.balance())}."
+            except SmsCenterError as e:
+                return f"NumberHub didn't accept that key ({html.escape(str(e))}).", ""
+            finally:
+                await cl.close()
+        else:
+            info = "Stored for when PVAPins is connected (it isn't tested yet)."
+        self.s.set_secret(dict((a, c) for a, _, c in WEB_SITES)[prov], key)
+        self.s.store.log(self.uid, "key", f"{PROV_NAME[prov]} key set")
+        if prov == "sc":
+            self.tracker.poke()
+        return None, info
+
+    async def website_card(self, prov: str, note: str = "") -> Reply:
+        name, key = PROV_NAME[prov], self.site_key(prov)
+        bal = "—"
+        if key and prov == "sc":
+            b = await check_key(key)
+            bal = usd(b) if b is not None else "couldn't read it"
+        elif key and prov == "nh":
+            cl = NumberHub(key)
+            try:
+                bal = usd(await cl.balance())
+            except SmsCenterError:
+                bal = "couldn't read it (check the key)"
+            finally:
+                await cl.close()
+        elif key:
+            bal = "n/a (not connected yet)"
+        txt = (f"🌐 <b>{name}</b>{'' if PROV_READY[prov] else ' <i>(not connected yet)</i>'}\n"
+               + (f"🔑 Key: set ✅ (…{html.escape(key[-4:])})\n💰 Balance: {bal}" if key else "🔑 Key: not set ❗")
+               + (f"\n\n{note}" if note else ""))
+        kb: KB = [[("🔄 Update key" if key else "🔑 Set key", f"web:k:{prov}")]]
+        if key:
+            kb.append([("🗑 Remove key", f"web:rm:{prov}")])
+        if prov == "sc":
+            kb.append([("🏹 Make hunter", "hu:n:0"), ("📱 Platforms", "pl:0")])
+        elif prov == "nh":
+            kb.append([("🏹 Make hunter", "hu:nh:0"), ("🏹 My hunters", "hu:l")])
+        kb.append([("⬅️ Websites", "web:l"), ("🏠 Menu", "m")])
+        return txt, kb
+
+    def websites_screen(self) -> Reply:
+        sites = [(prov, name) for prov, name, _ in WEB_SITES if self.site_ok(prov)]
+        lines = [f"{'✅' if self.site_key(prov) else '❌'} {name}" + ("" if PROV_READY[prov] else " (soon)") for prov, name in sites]
+        kb: KB = [[(f"{'✅' if self.site_key(prov) else '❌'} {name}", f"web:p:{prov}")] for prov, name in sites]
+        kb.append([("🏠 Menu", "m")])
+        return "🌐 <b>Websites</b> - tap one to set, update or remove your key\n" + "\n".join(lines), kb
+
+    async def ui_web(self, uid: int, p: list[str]) -> Reply | None:
+        sub, prov = (p[1] if len(p) > 1 else "l"), (p[2] if len(p) > 2 else "")
+        if sub == "l" or prov not in PROV_NAME or not self.site_ok(prov):
+            return self.websites_screen()
+        if sub == "p":
+            return await self.website_card(prov)
+        if sub == "k":
+            self.pending[uid] = ("webkey", prov, "")
+            return (f"🔑 <b>{PROV_NAME[prov]} key</b>\nSend your {PROV_NAME[prov]} API key as a message. I check it and delete your message right after."), [[("Cancel", f"web:p:{prov}")]]
+        if sub == "rm":
+            return f"Remove your <b>{PROV_NAME[prov]}</b> key? Your hunters on it will stop working until you set a key again.", [[("✅ Yes, remove", f"web:rmy:{prov}"), ("Cancel", f"web:p:{prov}")]]
+        if sub == "rmy":
+            self.s.d[dict((a, c) for a, _, c in WEB_SITES)[prov]] = ""
+            self.s.save()
+            self.s.store.log(self.uid, "key", f"{PROV_NAME[prov]} key removed")
+            return await self.website_card(prov, "🗑 Key removed.")
+        return self.websites_screen()
+
+    async def take_web_key(self, uid: int, prov: str, text: str) -> Reply:
+        self.wipe_input = True                                           # the key must not stay in the chat, even when it is refused
+        if prov not in PROV_NAME or not self.site_ok(prov):
+            return self.websites_screen()
+        err, info = await self.save_key(prov, text)
+        if err:
+            self.pending[uid] = ("webkey", prov, "")
+            return f"❌ {err}\nSend the key again, or Cancel.", [[("Cancel", f"web:p:{prov}")]]
+        return await self.website_card(prov, f"✅ Key saved (your message is deleted). {info}")
+
     async def cmd_nhkey(self, arg: str) -> Reply:
         """/nhkey <key>: this user's own NumberHub key (validated with /balance, stored sealed, the message is deleted)."""
         self.wipe_input = True                                           # the key must not stay in the chat, even when it is refused
@@ -3854,7 +3960,7 @@ class Hub:
         hs = prof.get("hunters", {})
         run = sum(1 for t in (self.apps[uid].hunts.values() if uid in self.apps else []) if not t.done())
         lines.append(f"🏹 {self.pl(len(hs), 'hunter')} ({run} running) · 📈 {self.pl(len(prof.get('tracks', {})), 'track')}")
-        lines.append(f"🔑 SmsCenter {'✅' if prof.get('api_key') else '❌'} · NumberHub {'✅' if prof.get('nh_key') else '❌'}")
+        lines.append(f"🔑 SmsCenter {'✅' if prof.get('api_key') else '❌'} · NumberHub {'✅' if prof.get('nh_key') else '❌'} · PVAPins {'✅' if prof.get('pv_key') else '❌'}")
         if hist:
             lines.append("\n<b>Latest numbers</b>")
             ico = {"code": "📩", "active": "⏳", "released": "🔓", "expired": "⌛", "kept": "⚠️", "cancelled": "🚫"}
