@@ -2156,7 +2156,7 @@ class App:
         try:
             cl = NumberHub(self.nh_key())
             try:
-                cs = sorted(await cl.countries_of(svc), key=lambda c: str(c.get("name") or "").lower())
+                cs = sorted((c for c in await cl.countries_of(svc) if c.get("in_stock")), key=lambda c: str(c.get("name") or "").lower())   # only what the website shows: in stock
             finally:
                 await cl.close()
         except SmsCenterError as e:
@@ -2164,7 +2164,7 @@ class App:
         pages = max(1, (len(cs) + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, pages - 1))
         part = cs[page * PER_PAGE:(page + 1) * PER_PAGE]
-        lab = lambda c: f"{flag(str(c.get('flag') or '').lower())} {str(c.get('name') or c['country'])[:11]} {usd(_num(c.get('price')))}{'' if c.get('in_stock') else ' ⛔'}"   # noqa: E731
+        lab = lambda c: f"{flag(str(c.get('flag') or '').lower())} {str(c.get('name') or c['country'])[:11]} {usd(_num(c.get('price')))}"   # noqa: E731
         kb: KB = [[(lab(c), f"hu:nhc:{svc}:{c['country']}") for c in part[i:i + 2]] for i in range(0, len(part), 2)]
         nav = []
         if page > 0:
@@ -2173,7 +2173,9 @@ class App:
         if page < pages - 1:
             nav.append(("➡️", f"hu:nhs:{svc}:{page + 1}"))
         kb += [nav, [("⬅️ Platforms", "hu:nh:0"), ("🏠 Menu", "m")]]
-        return f"🏹 <b>{html.escape(svc.upper())}</b> · NumberHub · step 2: pick the country ({len(cs)}; ⛔ = out of stock)", kb
+        if not cs:
+            return f"🏹 <b>{html.escape(svc.upper())}</b> · NumberHub\nNo country is in stock for this platform right now.", [[("⬅️ Platforms", "hu:nh:0"), ("🏠 Menu", "m")]]
+        return f"🏹 <b>{html.escape(svc.upper())}</b> · NumberHub · step 2: pick the country ({len(cs)} in stock)", kb
 
     async def nh_create(self, svc: str, cc: str) -> Reply:
         if (r := self.need_nh()):
