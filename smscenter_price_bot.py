@@ -558,7 +558,21 @@ class Store:
         if uid == self.d["admin"]:
             return True
         cfg = (self.d.get("prov_access") or {}).get(prov) or {}
+        if uid in cfg.get("deny", []):
+            return False
         return (cfg.get("mode") or PROV_DEFAULT.get(prov, "list")) == "all" or uid in cfg.get("users", [])
+
+    def prov_set(self, uid: int, prov: str, allow: bool) -> None:
+        """Allow / deny one user for a provider: in "all" mode a deny list, in "list" mode an allow list."""
+        cfg = self.d.setdefault("prov_access", {}).setdefault(prov, {"mode": PROV_DEFAULT[prov], "users": []})
+        cfg["users"] = [u for u in cfg.get("users", []) if u != uid]
+        cfg["deny"] = [u for u in cfg.get("deny", []) if u != uid]
+        mode = cfg.get("mode") or PROV_DEFAULT[prov]
+        if allow and mode != "all":
+            cfg["users"].append(uid)
+        elif not allow and mode == "all":
+            cfg["deny"].append(uid)
+        self.save()
 
     def log(self, uid: int, kind: str, text: str) -> None:
         ev = self.d.setdefault("events", [])
@@ -566,15 +580,25 @@ class Store:
         del ev[:-500]
         self.save(5.0)
 
-    def note_user(self, uid: int, username: str | None) -> None:
+    def note_user(self, uid: int, username: str | None, full_name: str | None = None) -> None:
+        """Remember how a user is called (@username, else their name) so the admin screens never show a bare id."""
         names = self.d.setdefault("names", {})
-        if username and names.get(str(uid)) != username:
-            names[str(uid)] = username
+        cur = names.get(str(uid))
+        cur = {"u": cur} if isinstance(cur, str) else (cur or {})                  # the first version stored just the username
+        new = {"u": username or cur.get("u") or "", "n": (full_name or cur.get("n") or "")[:40]}
+        if cur != new:
+            names[str(uid)] = new
             self.save(5.0)
 
-    def name_of(self, uid: int | str) -> str:
+    def known(self, uid: int | str) -> bool:
         n = (self.d.get("names") or {}).get(str(uid))
-        return f"@{n} ({uid})" if n else str(uid)
+        return bool(n) and bool(n if isinstance(n, str) else (n.get("u") or n.get("n")))
+
+    def name_of(self, uid: int | str, with_id: bool = False) -> str:
+        n = (self.d.get("names") or {}).get(str(uid))
+        n = {"u": n} if isinstance(n, str) else (n or {})
+        label = f"@{n['u']}" if n.get("u") else (n.get("n") or "")
+        return (f"{label} ({uid})" if with_id else label) if label else str(uid)
 
     # -- catch-all e-mail: the admin's profile holds the one domain / Gmail / app password; generated addresses live in each user's profile
     def mail_cfg(self) -> tuple[str, str, str] | None:
@@ -1492,6 +1516,8 @@ class App:
               [("📋 Tracked", "t:l")],
               [("⚙️ Settings", "s:m"), ("📜 History", "hi:0")],
               [("▶️ Resume monitoring" if s["paused"] else "⏸ Pause monitoring", "s:pause"), ("🔄 Check now", "k")]]
+        if self.is_admin():
+            kb.append([("🛠 Admin", "ad:m")])
         return txt, kb
 
     async def platforms_screen(self, page: int) -> Reply:
@@ -3492,9 +3518,9 @@ class Hub:
         self.wipe.discard(uid)
         return flag
 
-    async def handle(self, uid: int, text: str, username: str | None = None) -> Reply | None:
+    async def handle(self, uid: int, text: str, username: str | None = None, full_name: str | None = None) -> Reply | None:
         d = self.store.d
-        self.store.note_user(uid, username)
+        self.store.note_user(uid, username, full_name)
         self.bind_session_user(uid, username)
         head = text.strip().split(None, 1)                               # a command may be followed by a space or a new line
         cmd, arg = (head[0] if head else ""), (head[1] if len(head) > 1 else "")
@@ -3525,11 +3551,11 @@ class Hub:
             return await self.login_step(uid, text)
         return await self.app(uid).handle(uid, text)
 
-    async def ui(self, uid: int, data: str, username: str | None = None) -> Reply | None:
-        self.store.note_user(uid, username)
+    async def ui(self, uid: int, data: str, username: str | None = None, full_name: str | None = None) -> Reply | None:
+        self.store.note_user(uid, username, full_name)
         self.bind_session_user(uid, username)
-        if data.startswith("ad:"):                                       # admin panel: usage / codes / log / providers
-            return self.admin_ui(data) if uid == self.store.d["admin"] else None
+        if data.startswith("ad:"):                                       # admin panel: users / codes / log / access
+            return await self.admin_ui(data) if uid == self.store.d["admin"] else None
         if self.is_session_user(uid):
             if not data.startswith("sess:"):
                 return None
@@ -3687,83 +3713,230 @@ class Hub:
             self.login_note(uid, "resend failed: " + type(e).__name__)
             return f"❌ Could not resend the code: {html.escape(type(e).__name__)}. Send /session to start again.", _nav()
 
-    # -- admin panel: who did what, the codes that arrived, who may use which provider
-    ADMIN_BTNS = [[("📊 Usage per user", "ad:u:0"), ("📩 Codes", "ad:c:0")], [("🧾 Activity log", "ad:l:0"), ("🔌 Providers", "ad:p")], [("🏠 Menu", "m")]]
+    # -- admin panel: users as buttons (tap one for its data), codes, activity, who may use which provider
+    ADMIN_BTNS = [[("👥 Users", "ad:u:0"), ("📩 Codes", "ad:c:0")], [("🧾 Activity", "ad:l:0"), ("🔌 Access", "ad:p")], [("🏠 Menu", "m")]]
+    ICON = {"buy": "🛒", "code": "📩", "release": "🔓", "reject": "❌", "ended": "🚫", "hunter": "🏹", "key": "🔑", "session": "🔐", "admin": "🛠"}
 
-    def admin_ui(self, data: str) -> Reply:
+    def users_list(self) -> list[tuple[int, dict]]:
+        return [(int(k), prof) for k, prof in self.store.d["users"].items() if k.lstrip("-").isdigit()]
+
+    def last_active(self, uid: int, prof: dict) -> float:
+        ts = [e["t"] for e in prof.get("history", [])] + [ev["t"] for ev in self.store.d.get("events", []) if ev["u"] == uid]
+        return max(ts or [0])
+
+    @staticmethod
+    def prov_stats(hist: list, prov: str) -> tuple[int, int, float, int, int]:
+        """(bought, codes, spent, codes with an unknown price, bought without a code)"""
+        h = [e for e in hist if (e.get("prov") or "sc") == prov]
+        got = [e for e in h if e["state"] == "code"]
+        return (len(h), len(got), sum(e.get("price") or 0 for e in got), sum(1 for e in got if not e.get("price")),
+                sum(1 for e in h if e["state"] in ("released", "cancelled", "expired", "kept")))
+
+    @staticmethod
+    def pl(n: int, word: str) -> str:
+        return f"{n} {word}{'' if n == 1 else 's'}"
+
+    async def fill_names(self, uids: list[int]) -> None:
+        """Ask Telegram how users who never wrote since this feature was added are called (works for anyone who has used the bot)."""
+        for u in [u for u in uids if not self.store.known(u)][:12]:
+            try:
+                ch = await self.bot.get_chat(u)
+                self.store.note_user(u, getattr(ch, "username", None), getattr(ch, "full_name", None))
+            except Exception:                                            # noqa: BLE001
+                pass
+
+    async def admin_ui(self, data: str) -> Reply:
         p = data.split(":")
-        kind = p[1] if len(p) > 1 else "m"
-        page = int(p[2]) if len(p) > 2 and p[2].isdigit() else 0
+        kind, arg = (p[1] if len(p) > 1 else "m"), p[2:]
+        num = lambda i, dflt=0: int(arg[i]) if len(arg) > i and arg[i].lstrip("-").isdigit() else dflt   # noqa: E731
         if kind == "u":
-            return self.usage_screen(page)
-        if kind == "c":
-            return self.codes_screen(page)
-        if kind == "l":
-            return self.log_screen(page)
+            return await self.users_screen(num(0))
+        if kind == "ud":
+            return await self.user_detail(num(0))
+        if kind in ("c", "uc"):
+            return await self.codes_screen(num(1) if kind == "uc" else num(0), num(0) if kind == "uc" else None)
+        if kind == "cd":
+            return self.code_detail(num(0), arg[1] if len(arg) > 1 else "")
+        if kind in ("l", "ul"):
+            return await self.log_screen(num(1) if kind == "ul" else num(0), num(0) if kind == "ul" else None)
         if kind == "p":
             return self.providers_screen()
-        if kind == "pm" and len(p) > 3 and p[2] in PROV_DEFAULT and p[3] in ("all", "list"):
-            return self.provider_cmd(f"{p[2]} {p[3]}")
-        return ("🛠 <b>Admin</b>\nUsage per user · codes that arrived · activity log · who may use NumberHub / PVAPins.\n"
-                "<code>/provider</code> · <code>/usage</code> · <code>/codes</code> · <code>/log</code> · <code>/users</code> · <code>/sessionuser</code>"), self.ADMIN_BTNS
+        if kind == "pm" and len(arg) > 1 and arg[0] in PROV_DEFAULT and arg[1] in ("all", "list"):
+            return self.provider_cmd(f"{arg[0]} {arg[1]}")
+        if kind == "pu" and arg and arg[0] in PROV_DEFAULT:
+            return await self.provider_users(arg[0], num(1))
+        if kind == "pt" and len(arg) > 2 and arg[0] in PROV_DEFAULT:   # ad:pt:<prov>:<uid>:<back: u | page>
+            uid = num(1)
+            now = self.store.prov_ok(uid, arg[0])
+            self.store.prov_set(uid, arg[0], not now)
+            self.store.log(self.store.d["admin"], "admin", f"{PROV_NAME[arg[0]]}: {'denied' if now else 'allowed'} {self.store.name_of(uid)}")
+            return await (self.user_detail(uid) if arg[2] == "u" else self.provider_users(arg[0], num(2)))
+        if kind == "st":                                                 # session-only on / off
+            uid, d = num(0), self.store.d
+            su = d.setdefault("session_users", [])
+            su.remove(uid) if uid in su else su.append(uid)
+            self.store.save()
+            self.store.log(d["admin"], "admin", f"session-only {'added' if uid in su else 'removed'}: {self.store.name_of(uid)}")
+            return await self.user_detail(num(0))
+        if kind == "sh":                                                 # stop every hunter of this user
+            uid, n = num(0), 0
+            app = self.apps.get(uid)
+            for hid in list(app.hunts) if app else []:
+                await app.stop_hunter(hid, "stopped by the admin")
+                n += 1
+            self.store.log(self.store.d["admin"], "admin", f"stopped {n} hunter(s) of {self.store.name_of(uid)}")
+            return await self.user_detail(uid, f"⏹ Stopped {self.pl(n, 'hunter')}.")
+        if kind == "bl":                                                 # block / unblock
+            uid = num(0)
+            blocked = uid in self.store.d["blocked"]
+            await self.admin("/allow" if blocked else "/deny", str(uid))
+            self.store.log(self.store.d["admin"], "admin", f"{'unblocked' if blocked else 'blocked'} {self.store.name_of(uid)}")
+            return await self.user_detail(uid)
+        return await self.admin_home()
 
-    def paged(self, title: str, rows: list[str], page: int, per: int, tag: str) -> Reply:
-        pages = max(1, (len(rows) + per - 1) // per)
-        page = max(0, min(page, pages - 1))
-        body = "\n".join(rows[page * per:(page + 1) * per]) or "nothing yet"
+    async def admin_home(self) -> Reply:
+        d, us = self.store.d, self.users_list()
+        day = time.time() - 86400
+        codes = [e for _, prof in us for e in prof.get("history", []) if e["state"] == "code"]
+        running = sum(1 for a in self.apps.values() for t in a.hunts.values() if not t.done())
+        txt = (f"🛠 <b>Admin</b>\n👥 {self.pl(len(us), 'user')} · {sum(1 for u, prof in us if self.last_active(u, prof) > day)} active in 24 h\n"
+               f"📩 {self.pl(len(codes), 'code')} received · {sum(1 for e in codes if e['t'] > day)} in 24 h\n🏹 {self.pl(running, 'hunter')} hunting now\n"
+               f"🔌 NumberHub: {self.access_word('nh')} · PVAPins: {self.access_word('pv')}")
+        return txt, self.ADMIN_BTNS
+
+    def access_word(self, prov: str) -> str:
+        cfg = (self.store.d.get("prov_access") or {}).get(prov) or {}
+        return "everyone" if (cfg.get("mode") or PROV_DEFAULT[prov]) == "all" else self.pl(len(cfg.get("users", [])), "user") + " + admin"
+
+    def nav_row(self, base: str, page: int, pages: int) -> list:
         nav = []
         if page > 0:
-            nav.append(("⬅️", f"ad:{tag}:{page - 1}"))
+            nav.append(("⬅️", f"{base}:{page - 1}"))
         nav.append((f"{page + 1}/{pages}", "noop"))
         if page < pages - 1:
-            nav.append(("➡️", f"ad:{tag}:{page + 1}"))
-        return f"{title}\n{body}", [nav, [("🔄 Refresh", f"ad:{tag}:{page}"), ("🛠 Admin", "ad:m")]]
+            nav.append(("➡️", f"{base}:{page + 1}"))
+        return nav
 
-    def usage_screen(self, page: int) -> Reply:
+    async def users_screen(self, page: int) -> Reply:
+        us = sorted(self.users_list(), key=lambda x: -self.last_active(*x))
+        per = 8
+        pages = max(1, (len(us) + per - 1) // per)
+        page = max(0, min(page, pages - 1))
+        part = us[page * per:(page + 1) * per]
+        await self.fill_names([u for u, _ in part])
+        kb: KB = []
+        for u, prof in part:
+            la = self.last_active(u, prof)
+            dot = "👑" if u == self.store.d["admin"] else "🟢" if time.time() - la < 3600 else "🟡" if time.time() - la < 86400 else "⚪"
+            codes = sum(1 for e in prof.get("history", []) if e["state"] == "code")
+            kb.append([(f"{dot} {self.store.name_of(u)[:20]} · {codes}📩 · {ago(la) if la else 'never'}", f"ad:ud:{u}")])
+        kb.append(self.nav_row("ad:u", page, pages))
+        kb.append([("🔄 Refresh", f"ad:u:{page}"), ("🛠 Admin", "ad:m")])
+        return f"👥 <b>Users</b> ({len(us)}) - tap one to see what they did\n<i>🟢 active now · 🟡 today · ⚪ older · 📩 = codes received</i>", kb
+
+    async def user_detail(self, uid: int, note: str = "") -> Reply:
         d = self.store.d
-        blocks = []
-        users = [(k, prof) for k, prof in d["users"].items() if k.lstrip("-").isdigit()]
-        def last(k, prof):
-            ts = [e["t"] for e in prof.get("history", [])] + [ev["t"] for ev in d.get("events", []) if str(ev["u"]) == k]
-            return max(ts or [0])
-        for k, prof in sorted(users, key=lambda kv: -last(*kv)):
-            hist = prof.get("history", [])
-            lines = [f"<b>{html.escape(self.store.name_of(k))}</b>{' 👑' if k == str(d['admin']) else ''} · active {ago(last(k, prof)) + ' ago' if last(k, prof) else 'never'}"]
-            for prov in ("sc", "nh", "pv"):
-                h = [e for e in hist if (e.get("prov") or "sc") == prov]
-                if h or prov == "sc":
-                    got = [e for e in h if e["state"] == "code"]
-                    lines.append(f"  {PROV_NAME[prov]}: {len(h)} bought · {len(got)} codes · spent {usd(sum(e.get('price') or 0 for e in got))} · "
-                                 f"{sum(1 for e in h if e['state'] in ('released', 'cancelled', 'expired', 'kept'))} no code")
-            lines.append(f"  hunters {len(prof.get('hunters', {}))} · tracks {len(prof.get('tracks', {}))} · keys: SmsCenter {'✅' if prof.get('api_key') else '❌'} NumberHub {'✅' if prof.get('nh_key') else '❌'}")
-            blocks.append("\n".join(lines))
-        return self.paged("📊 <b>Usage per user</b> (what the hunters bought; spent = numbers whose code arrived)", blocks, page, 5, "u")
+        prof = d["users"].get(str(uid)) or {}
+        await self.fill_names([uid])
+        hist = prof.get("history", [])
+        la = self.last_active(uid, prof)
+        status = ("👑 admin" if uid == d["admin"] else "🚫 blocked" if uid in d["blocked"] else "🔐 session-only" if self.is_session_user(uid)
+                  else "✅ allowed" if self.allowed(uid) else "⛔ no access")
+        lines = [f"👤 <b>{html.escape(self.store.name_of(uid))}</b>  <code>{uid}</code>", f"{status} · active {ago(la) + ' ago' if la else 'never'}"]
+        if note:
+            lines.append(note)
+        lines.append("")
+        for prov in ("sc", "nh", "pv"):
+            n, c, spent, unk, nocode = self.prov_stats(hist, prov)
+            if n or prov == "sc":
+                lines.append(f"<b>{PROV_NAME[prov]}</b>: {n} bought · {self.pl(c, 'code')} · {nocode} no code · "
+                             + (f"spent {usd(spent)}" + (f" (+{unk} price n/a)" if unk else "") if c and (spent or not unk) else ("spent n/a" if c else "spent $0.00")))
+        hs = prof.get("hunters", {})
+        run = sum(1 for t in (self.apps[uid].hunts.values() if uid in self.apps else []) if not t.done())
+        lines.append(f"🏹 {self.pl(len(hs), 'hunter')} ({run} running) · 📈 {self.pl(len(prof.get('tracks', {})), 'track')}")
+        lines.append(f"🔑 SmsCenter {'✅' if prof.get('api_key') else '❌'} · NumberHub {'✅' if prof.get('nh_key') else '❌'}")
+        if hist:
+            lines.append("\n<b>Latest numbers</b>")
+            ico = {"code": "📩", "active": "⏳", "released": "🔓", "expired": "⌛", "kept": "⚠️", "cancelled": "🚫"}
+            for e in hist[:5]:
+                lines.append(f"{ico.get(e['state'], '•')} +{html.escape(e['tel'])} · {pn(e)}" + (f" · <code>{html.escape(str(e['code']))}</code>" if e["state"] == "code" else "")
+                             + f" · {time.strftime('%d %b %H:%M', time.localtime(e['t']))}")
+        yes = lambda prov: "✅" if self.store.prov_ok(uid, prov) else "❌"   # noqa: E731
+        kb: KB = [[("📩 Their codes", f"ad:uc:{uid}:0"), ("🧾 Their activity", f"ad:ul:{uid}:0")],
+                  [(f"{yes('nh')} NumberHub", f"ad:pt:nh:{uid}:u"), (f"{yes('pv')} PVAPins", f"ad:pt:pv:{uid}:u")]]
+        if uid != d["admin"]:
+            kb.append([(("🔐 Session-only: ON" if self.is_session_user(uid) else "🔐 Session-only: off"), f"ad:st:{uid}"),
+                       (("✅ Unblock" if uid in d["blocked"] else "🚫 Block"), f"ad:bl:{uid}")])
+        kb.append([("⏹ Stop their hunters", f"ad:sh:{uid}"), ("🔄 Refresh", f"ad:ud:{uid}")])
+        kb.append([("⬅️ Users", "ad:u:0"), ("🛠 Admin", "ad:m")])
+        return "\n".join(lines), kb
 
-    def codes_screen(self, page: int) -> Reply:
+    async def codes_screen(self, page: int, uid: int | None = None) -> Reply:
         d = self.store.d
-        got = sorted(((e, k) for k, prof in d["users"].items() if k.lstrip("-").isdigit() for e in prof.get("history", []) if e["state"] == "code"), key=lambda x: -x[0]["t"])
-        rows = [f"{time.strftime('%d %b %H:%M', time.localtime(e['t']))} · {html.escape(self.store.name_of(k))} · {pn(e)} · +{html.escape(e['tel'])} · "
-                f"<code>{html.escape(str(e['code']))}</code> · {usd(e.get('price'))}" for e, k in got]
-        return self.paged(f"📩 <b>Codes received</b> ({len(rows)})", rows, page, 8, "c")
+        got = sorted(((e, k) for k, prof in d["users"].items() if k.lstrip("-").isdigit() and (uid is None or k == str(uid))
+                      for e in prof.get("history", []) if e["state"] == "code"), key=lambda x: -x[0]["t"])
+        per = 8
+        pages = max(1, (len(got) + per - 1) // per)
+        page = max(0, min(page, pages - 1))
+        part = got[page * per:(page + 1) * per]
+        await self.fill_names([int(k) for _, k in part])
+        kb: KB = [[(f"📩 {e['code']} · +{e['tel']}" + ("" if uid is not None else f" · {self.store.name_of(k)[:12]}"), f"ad:cd:{k}:{e['idNum']}")] for e, k in part]
+        kb.append(self.nav_row("ad:c" if uid is None else f"ad:uc:{uid}", page, pages))
+        kb.append([("🔄 Refresh", f"ad:c:{page}" if uid is None else f"ad:uc:{uid}:{page}"), ("⬅️ User", f"ad:ud:{uid}") if uid is not None else ("🛠 Admin", "ad:m")])
+        who = f" of {html.escape(self.store.name_of(uid))}" if uid is not None else ""
+        return f"📩 <b>Codes received{who}</b> ({len(got)}) - tap one for details", kb
 
-    def log_screen(self, page: int) -> Reply:
-        evs = list(reversed(self.store.d.get("events", [])))
-        icon = {"buy": "🛒", "code": "📩", "release": "🔓", "reject": "❌", "ended": "🚫", "hunter": "🏹", "key": "🔑", "session": "🔐", "admin": "🛠"}
-        rows = [f"{icon.get(ev['k'], '•')} {ago(ev['t'])} · {html.escape(self.store.name_of(ev['u']))} · {html.escape(ev['x'])}" for ev in evs]
-        return self.paged(f"🧾 <b>Activity log</b> ({len(rows)}, newest first)", rows, page, 12, "l")
+    def code_detail(self, uid: int, id_num: str) -> Reply:
+        e = next((x for x in (self.store.d["users"].get(str(uid)) or {}).get("history", []) if str(x["idNum"]) == id_num), None)
+        if e is None:
+            return "I don't have that number any more.", [[("⬅️ Codes", "ad:c:0"), ("🛠 Admin", "ad:m")]]
+        chk = {"clean": "🟢 clean", "banned": "🔴 banned", "registered": "🟠 registered"}.get(e.get("chk", "off"), "⚪ not checked")
+        txt = (f"📩 <b>Code</b>  <code>{html.escape(str(e['code']))}</code>\n📞 <code>+{html.escape(e['tel'])}</code>\n"
+               f"👤 {html.escape(self.store.name_of(uid))} · {pn(e)}\n{fl(e)} {html.escape(e['name'])} · {html.escape(e['sname'])}"
+               + (f" · {usd(e['price'])}" if e.get("price") else " · price n/a") + f"\n{chk}\n🕒 {time.strftime('%d %b %Y %H:%M', time.localtime(e['t']))}")
+        return txt, [[("📋 Copy code", f"copy:{e['code']}"), ("📋 Copy number", f"copy:+{e['tel']}")], [("👤 User", f"ad:ud:{uid}"), ("⬅️ Codes", "ad:c:0")]]
+
+    async def log_screen(self, page: int, uid: int | None = None) -> Reply:
+        evs = [ev for ev in reversed(self.store.d.get("events", [])) if uid is None or ev["u"] == uid]
+        per = 12
+        pages = max(1, (len(evs) + per - 1) // per)
+        page = max(0, min(page, pages - 1))
+        part = evs[page * per:(page + 1) * per]
+        await self.fill_names(list({ev["u"] for ev in part}))
+        rows = [f"{self.ICON.get(ev['k'], '•')} <b>{ago(ev['t'])}</b>" + ("" if uid is not None else f" · {html.escape(self.store.name_of(ev['u']))}") + f"\n    {html.escape(ev['x'])}" for ev in part]
+        kb: KB = [self.nav_row("ad:l" if uid is None else f"ad:ul:{uid}", page, pages),
+                  [("🔄 Refresh", f"ad:l:{page}" if uid is None else f"ad:ul:{uid}:{page}"), ("⬅️ User", f"ad:ud:{uid}") if uid is not None else ("🛠 Admin", "ad:m")]]
+        who = f" of {html.escape(self.store.name_of(uid))}" if uid is not None else ""
+        return f"🧾 <b>Activity{who}</b> ({len(evs)}, newest first)\n" + ("\n".join(rows) or "nothing yet"), kb
 
     def providers_screen(self) -> Reply:
         d = self.store.d
-        lines, kb = ["🔌 <b>Providers</b> - who may use them (the admin always can)"], []
+        lines, kb = ["🔌 <b>Access</b> - who may use each provider (the admin always can)"], []
         for prov in ("nh", "pv"):
             cfg = (d.get("prov_access") or {}).get(prov) or {}
             mode = cfg.get("mode") or PROV_DEFAULT[prov]
-            who = "everyone" if mode == "all" else (", ".join(self.store.name_of(u) for u in cfg.get("users", [])) or "admin only")
-            lines.append(f"\n<b>{PROV_NAME[prov]}</b>{'' if PROV_READY[prov] else ' (not connected yet)'}: {'🌐 all users' if mode == 'all' else '🔒 list'}\n  allowed: {html.escape(who)}")
-            kb.append([(("✅ " if mode == "all" else "") + f"{PROV_NAME[prov]}: all users", f"ad:pm:{prov}:all"), (("✅ " if mode == "list" else "") + "list only", f"ad:pm:{prov}:list")])
-        lines.append("\n<code>/provider nh allow &lt;id&gt;</code> · <code>/provider nh deny &lt;id&gt;</code> · <code>/provider pv allow &lt;id&gt;</code> (ids: /users)")
+            lines.append(f"\n<b>{PROV_NAME[prov]}</b>{'' if PROV_READY[prov] else ' <i>(not connected yet)</i>'}: "
+                         + (f"🌐 everyone" + (f" except {self.pl(len(cfg.get('deny', [])), 'user')}" if cfg.get("deny") else "") if mode == "all" else f"🔒 {self.pl(len(cfg.get('users', [])), 'chosen user')} + admin"))
+            kb.append([(("✅ " if mode == "all" else "") + f"{PROV_NAME[prov]}: everyone", f"ad:pm:{prov}:all"), (("✅ " if mode == "list" else "") + "chosen users", f"ad:pm:{prov}:list")])
+            kb.append([(f"👥 Pick users for {PROV_NAME[prov]}", f"ad:pu:{prov}:0")])
         kb.append([("🛠 Admin", "ad:m")])
         return "\n".join(lines), kb
+
+    async def provider_users(self, prov: str, page: int) -> Reply:
+        """Quick select: every user as a button, tap = allow / deny."""
+        us = sorted((x for x in self.users_list() if x[0] != self.store.d["admin"]), key=lambda x: -self.last_active(*x))
+        per = 12
+        pages = max(1, (len(us) + per - 1) // per)
+        page = max(0, min(page, pages - 1))
+        part = us[page * per:(page + 1) * per]
+        await self.fill_names([u for u, _ in part])
+        btns = [(f"{'✅' if self.store.prov_ok(u, prov) else '❌'} {self.store.name_of(u)[:16]}", f"ad:pt:{prov}:{u}:{page}") for u, _ in part]
+        kb: KB = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        kb.append(self.nav_row(f"ad:pu:{prov}", page, pages))
+        kb.append([("⬅️ Access", "ad:p"), ("🛠 Admin", "ad:m")])
+        mode = ((self.store.d.get("prov_access") or {}).get(prov) or {}).get("mode") or PROV_DEFAULT[prov]
+        return (f"👥 <b>{PROV_NAME[prov]} access</b> - tap a user to allow ✅ / deny ❌\n"
+                f"<i>Mode: {'everyone (taps add or remove an exception)' if mode == 'all' else 'chosen users only'}</i>"), kb
 
     def provider_cmd(self, arg: str) -> Reply:
         """/provider [nh|pv] [all|list|allow <id>|deny <id>]"""
@@ -3771,21 +3944,20 @@ class Hub:
         w = arg.split()
         if not w:
             return self.providers_screen()
+        usage = "Usage: <code>/provider nh|pv all|list</code> · <code>/provider nh|pv allow|deny &lt;user id&gt;</code>"
         if w[0] not in PROV_DEFAULT:
-            return "Usage: <code>/provider nh|pv all|list</code> · <code>/provider nh|pv allow|deny &lt;user id&gt;</code>", self.ADMIN_BTNS
-        prov, cfg = w[0], d.setdefault("prov_access", {}).setdefault(w[0], {"mode": PROV_DEFAULT[w[0]], "users": []})
+            return usage, self.ADMIN_BTNS
+        prov = w[0]
+        cfg = d.setdefault("prov_access", {}).setdefault(prov, {"mode": PROV_DEFAULT[prov], "users": []})
         if len(w) > 1 and w[1] in ("all", "list"):
             cfg["mode"] = w[1]
             self.store.log(d["admin"], "admin", f"{PROV_NAME[prov]} access: {w[1]}")
+            self.store.save()
         elif len(w) > 2 and w[1] in ("allow", "deny") and w[2].lstrip("-").isdigit():
-            uid = int(w[2])
-            cfg["users"] = [u for u in cfg.get("users", []) if u != uid]
-            if w[1] == "allow":
-                cfg["users"].append(uid)                                 # counts while the mode is "list only" (in "all" everybody may use it anyway)
-            self.store.log(d["admin"], "admin", f"{PROV_NAME[prov]}: {w[1]} {uid}")
+            self.store.prov_set(int(w[2]), prov, w[1] == "allow")
+            self.store.log(d["admin"], "admin", f"{PROV_NAME[prov]}: {w[1]} {self.store.name_of(int(w[2]))}")
         elif len(w) > 1:
-            return "Usage: <code>/provider nh|pv all|list</code> · <code>/provider nh|pv allow|deny &lt;user id&gt;</code>", self.ADMIN_BTNS
-        self.store.save()
+            return usage, self.ADMIN_BTNS
         return self.providers_screen()
 
     def session_users_cmd(self, arg: str) -> Reply:
@@ -4030,7 +4202,7 @@ class Hub:
     async def admin(self, cmd: str, arg: str) -> Reply:
         d = self.store.d
         if cmd in ("/admin", "/usage", "/codes", "/log"):
-            return self.admin_ui("ad:" + {"/admin": "m", "/usage": "u", "/codes": "c", "/log": "l"}[cmd] + (":" + arg.strip() if arg.strip().isdigit() else ":0"))
+            return await self.admin_ui("ad:" + {"/admin": "m", "/usage": "u", "/codes": "c", "/log": "l"}[cmd] + (":" + arg.strip() if arg.strip().isdigit() else ":0"))
         if cmd == "/provider":
             return self.provider_cmd(arg.strip())
         if cmd == "/sessionstr":
@@ -4091,7 +4263,7 @@ class Hub:
         lines = [f"Access: {d['access']}", f"Allowed IDs: {', '.join(map(str, d['allowed'])) or '-'}", f"Blocked IDs: {', '.join(map(str, d['blocked'])) or '-'}", ""]
         for k, prof in d["users"].items():
             n = sum(1 for t in prof.get("tracks", {}).values() if t.get("on"))
-            lines.append(f"{self.store.name_of(k)}{' (admin)' if k == str(d['admin']) else ''} · {n} tracking · key {'set' if prof.get('api_key') else 'not set'}")
+            lines.append(f"{self.store.name_of(k, True)}{' (admin)' if k == str(d['admin']) else ''} · {n} tracking · key {'set' if prof.get('api_key') else 'not set'}")
         return "<b>Users</b>\n" + pre(lines), _nav()
 
 
@@ -4213,7 +4385,7 @@ async def main() -> int:
 
     @dp.message(F.text, F.chat.type == "private")
     async def on_text(m: Message):
-        res = await hub.handle(m.from_user.id, m.text, m.from_user.username)
+        res = await hub.handle(m.from_user.id, m.text, m.from_user.username, m.from_user.full_name)
         wipe = hub.take_wipe(m.from_user.id)
         if m.text.startswith("/setkey") or wipe:
             try:
@@ -4229,7 +4401,7 @@ async def main() -> int:
             await q.answer()                                              # first: a slow screen must not make the tap "too old"; old taps from when the bot was off are just ignored
         except Exception:                                                 # noqa: BLE001
             pass
-        res = await hub.ui(q.from_user.id, q.data or "", q.from_user.username)
+        res = await hub.ui(q.from_user.id, q.data or "", q.from_user.username, q.from_user.full_name)
         try:
             if res:
                 await q.message.edit_text(res[0], parse_mode="HTML", disable_web_page_preview=True, reply_markup=to_markup(res[1]))
