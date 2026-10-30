@@ -35,6 +35,8 @@ if HERE not in sys.path:
 STATE_PATH = os.environ.get("SESSIONBOT_STATE") or os.path.join(HERE, ".sessionbot_state.json")
 SESS_DIR = os.environ.get("SESSIONBOT_SESSIONS_DIR") or os.path.join(HERE, "sessionbot_sessions")
 LOGIN_TTL = 300                      # a half-finished phone login is forgotten after this many seconds
+CLONE_WAIT = 45.0                    # seconds to wait for the code, auto-read off the source account's own session
+CLONE_TTL = 300                      # a half-finished clone (e.g. stuck on a 2FA password) is given up after this long
 TG_SERVICE_CHAT = 777000             # Telegram's own "Telegram" service notifications account
 
 KB = list[list[tuple[str, str]]]
@@ -143,10 +145,12 @@ class Manager:
         self.watch_tasks: dict[str, asyncio.Task] = {}
         self.login: dict | None = None             # the one in-progress phone+code login (single admin)
         self.login_timer: asyncio.TimerHandle | None = None
+        self.clone: dict | None = None             # the one in-progress clone (single admin): read the code from the SOURCE account's own session
+        self.clone_timer: asyncio.TimerHandle | None = None
         os.makedirs(SESS_DIR, exist_ok=True)
 
     def base(self, phone: str) -> str:
-        return os.path.join(SESS_DIR, re.sub(r"[^0-9A-Za-z+_-]", "", phone) or phone)      # keep letters too: the id{n} fallback for phone-less accounts has no digits-only clash
+        return os.path.join(SESS_DIR, re.sub(r"[^0-9A-Za-z+_#-]", "", phone) or phone)      # keep letters/# too: the id{n} fallback and #2/#3 clone slots must not collide on disk
 
     def allowed(self, uid: int) -> bool:
         return self.store.d["admin"] == uid
@@ -229,6 +233,7 @@ class Manager:
     async def shutdown(self) -> None:
         for phone in list(self.watch_tasks):
             await self.stop_watch(phone)
+        await self._cleanup_clone()
 
     # -- import
     async def import_file(self, local_path: str) -> tuple[str | None, str]:
@@ -258,8 +263,8 @@ class Manager:
             except OSError:
                 pass
         who = (me.first_name or "") + (f" (@{me.username})" if me.username else "")
-        self.store.d["accounts"].setdefault(phone, {})["added_at"] = self.store.d["accounts"].get(phone, {}).get("added_at") or time.time()
-        self.store.d["accounts"][phone]["name"] = who.strip() or phone
+        acc = self.store.d["accounts"].setdefault(phone, {})
+        acc["added_at"], acc["name"], acc["phone"] = acc.get("added_at") or time.time(), who.strip() or phone, phone
         self.store.save()
         return phone, f"{'Updated' if existed else 'Added'} <b>{html.escape(who.strip() or phone)}</b> ({html.escape(phone)})."
 
@@ -379,6 +384,159 @@ class Manager:
         self.store.d["accounts"].pop(phone, None)
         self.store.save()
 
+    # -- clone: a brand-new, separate authorized session for an account that already has one, with the code
+    # read automatically off the EXISTING session's own incoming messages - nobody ever types or sees the code.
+    def arm_clone(self) -> None:
+        if self.clone_timer:
+            self.clone_timer.cancel()
+        self.clone_timer = asyncio.get_running_loop().call_later(CLONE_TTL, lambda: asyncio.create_task(self.clone_expire()))
+
+    async def clone_expire(self) -> None:
+        await self.notify("⏱ The clone timed out. Send /menu → account → 🧬 Clone session to try again.")
+        await self._cleanup_clone()
+
+    async def start_clone(self, source_key: str) -> tuple[bool, str]:
+        """-> (True, new account key) once the code-wait is underway, or (False, reason)."""
+        acc = self.store.d["accounts"].get(source_key)
+        if acc is None:
+            return False, "Unknown account."
+        phone = acc.get("phone") or source_key
+        try:
+            src, src_mine = await self.client_for(source_key)
+        except Exception as e:                                           # noqa: BLE001
+            return False, f"Couldn't connect to the existing session: {html.escape(type(e).__name__)}."
+        try:
+            if not await src.is_user_authorized():
+                if src_mine:
+                    await src.disconnect()
+                return False, "The existing session isn't logged in any more - nothing to clone from."
+        except Exception as e:                                           # noqa: BLE001
+            if src_mine:
+                await src.disconnect()
+            return False, f"Couldn't check the existing session: {html.escape(type(e).__name__)}."
+        n = 2
+        while f"{phone}#{n}" in self.store.d["accounts"]:
+            n += 1
+        new_key = f"{phone}#{n}"
+        try:
+            new_c = await self.open(new_key)
+        except Exception as e:                                           # noqa: BLE001
+            if src_mine:
+                await src.disconnect()
+            return False, f"Couldn't start the new session: {html.escape(type(e).__name__)}."
+        try:
+            sent = await new_c.send_code_request(phone)
+        except Exception as e:                                           # noqa: BLE001
+            await new_c.disconnect()
+            if src_mine:
+                await src.disconnect()
+            return False, f"Couldn't request a code: {html.escape(type(e).__name__)}."
+        from telethon import events
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _catch(ev):                                            # noqa: ANN001
+            m = re.search(r"\b(\d{5,6})\b", ev.raw_text or "")
+            if m and not fut.done():
+                fut.set_result(m.group(1))
+        src.add_event_handler(_catch, events.NewMessage(chats=TG_SERVICE_CHAT))
+        self.clone = {"source_key": source_key, "source_client": src, "source_mine": src_mine, "phone": phone,
+                      "new_key": new_key, "new_client": new_c, "hash": sent.phone_code_hash, "future": fut,
+                      "handler": _catch, "stage": "code"}
+        self.arm_clone()
+        return True, new_key
+
+    async def run_clone_wait(self) -> None:
+        """Waits (bounded) for the auto-caught code, signs the new session in, and reports the outcome - never blocks the bot."""
+        from telethon.errors import SessionPasswordNeededError
+        clone = self.clone
+        if not clone:
+            return
+        try:
+            code = await asyncio.wait_for(clone["future"], CLONE_WAIT)
+        except asyncio.TimeoutError:
+            await self.notify(f"⌛ Clone of <code>{html.escape(clone['phone'])}</code> timed out - no code arrived within {int(CLONE_WAIT)}s.")
+            await self._cleanup_clone()
+            return
+        try:
+            await clone["new_client"].sign_in(phone=clone["phone"], code=code, phone_code_hash=clone["hash"])
+        except SessionPasswordNeededError:
+            clone["stage"] = "pw"
+            self.arm_clone()
+            await self.notify(f"🔒 Clone of <code>{html.escape(clone['phone'])}</code>: this account has 2-step verification. "
+                              "Send its password in this chat. I delete your message right after.")
+            return
+        except Exception as e:                                           # noqa: BLE001
+            await self.notify(f"❌ Clone of <code>{html.escape(clone['phone'])}</code> failed: {html.escape(type(e).__name__)}.")
+            await self._cleanup_clone()
+            return
+        await self._finish_clone_success()
+
+    async def clone_sign_in_password(self, password: str) -> tuple[bool, str]:
+        """-> (done, message). done=False: wrong password, still waiting. done=True: resolved (success or given up)."""
+        from telethon.errors import PasswordHashInvalidError
+        clone = self.clone
+        if not clone or clone.get("stage") != "pw":
+            return True, "No clone is waiting for a password."
+        self.arm_clone()
+        try:
+            await clone["new_client"].sign_in(password=password)
+        except PasswordHashInvalidError:
+            return False, "❌ Wrong password. Send it again, or Cancel."
+        except Exception as e:                                           # noqa: BLE001
+            await self._cleanup_clone()
+            return True, f"❌ Clone failed: {html.escape(type(e).__name__)}."
+        await self._finish_clone_success()
+        return True, "✅ Done - check the notification above."
+
+    async def _finish_clone_success(self) -> None:
+        clone = self.clone
+        me = await clone["new_client"].get_me()
+        who = (me.first_name or "") + (f" (@{me.username})" if me.username else "")
+        try:
+            clone["new_client"].session.save()                           # persists to disk independent of the connection - safe to disconnect right after
+        except Exception:                                                # noqa: BLE001
+            pass
+        await self._teardown_clone()
+        self.store.d["accounts"][clone["new_key"]] = {"watch": False, "added_at": time.time(), "name": who.strip() or clone["phone"],
+                                                        "phone": clone["phone"], "clone_of": clone["source_key"]}
+        self.store.save()
+        await self.notify(f"🧬 Clone ready: <b>{html.escape(who.strip())}</b> ({html.escape(clone['phone'])}) is now its own, separate session "
+                          f"(<code>{html.escape(clone['new_key'])}</code>), alongside the one it was cloned from.")
+
+    async def _cleanup_clone(self) -> None:
+        if not self.clone:
+            return
+        new_key = self.clone["new_key"]
+        await self._teardown_clone()
+        for ext in (".session", ".session-journal"):                     # the sign-in never completed: nothing to keep
+            try:
+                os.remove(self.base(new_key) + ext)
+            except FileNotFoundError:
+                pass
+
+    async def _teardown_clone(self) -> None:
+        """Close both clients and clear self.clone. Whether the new session's file is kept or deleted is the caller's decision, made after this returns."""
+        clone, self.clone = self.clone, None
+        if not clone:
+            return
+        from telethon import events
+        try:
+            clone["source_client"].remove_event_handler(clone["handler"], events.NewMessage)
+        except Exception:                                                # noqa: BLE001
+            pass
+        if clone.get("source_mine"):
+            try:
+                await clone["source_client"].disconnect()
+            except Exception:                                            # noqa: BLE001
+                pass
+        try:
+            await clone["new_client"].disconnect()
+        except Exception:                                                # noqa: BLE001
+            pass
+        if self.clone_timer:
+            self.clone_timer.cancel()
+            self.clone_timer = None
+
 
 # ── the bot ───────────────────────────────────────────────────────────────────────────────────────────
 def _nav() -> KB:
@@ -399,11 +557,11 @@ def accounts_screen(mgr: Manager) -> Reply:
         return "📂 <b>Accounts</b>\nNone yet. Add one below.", [[("➕ Add account", "a:add")], [("🏠 Menu", "m")]]
     kb: KB = []
     for phone, acc in sorted(accs.items(), key=lambda kv: -(kv[1].get("added_at") or 0)):
-        dot = "📡" if acc.get("watch") else "⚪"
+        dot = "🧬" if acc.get("clone_of") else "📡" if acc.get("watch") else "⚪"
         kb.append([(f"{dot} {(acc.get('name') or phone)[:24]}", f"a:v:{phone}")])
     kb.append([("➕ Add account", "a:add")])
     kb.append([("🏠 Menu", "m")])
-    return f"📂 <b>Accounts</b> ({len(accs)})\n<i>📡 = OTP watch on</i>", kb
+    return f"📂 <b>Accounts</b> ({len(accs)})\n<i>📡 = OTP watch on · 🧬 = a clone of another account</i>", kb
 
 
 def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
@@ -411,11 +569,15 @@ def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
     if acc is None:
         return "I don't manage that account any more.", [[("⬅️ Accounts", "a:l")]]
     watch = bool(acc.get("watch"))
-    txt = (f"👤 <b>{html.escape(acc.get('name') or phone)}</b>\n📞 <code>{html.escape(phone)}</code>\n"
-           f"Added {ago(acc.get('added_at') or time.time())}\n📡 OTP watch: {'ON' if watch else 'off'}"
+    src = acc.get("clone_of")
+    src_name = (mgr.store.d["accounts"].get(src) or {}).get("name") if src else None
+    txt = (f"👤 <b>{html.escape(acc.get('name') or phone)}</b>\n📞 <code>{html.escape(acc.get('phone') or phone)}</code>\n"
+           + (f"🧬 Clone of {html.escape(src_name or src)}\n" if src else "")
+           + f"Added {ago(acc.get('added_at') or time.time())}\n📡 OTP watch: {'ON' if watch else 'off'}"
            + (f"\n\n{note}" if note else ""))
     kb: KB = [[("🔁 Validate", f"a:val:{phone}"), ("📟 Sessions", f"a:s:{phone}:0")],
               [(("📡 Watch: ON" if watch else "📡 Watch: off"), f"a:w:{phone}")],
+              [("🧬 Clone session", f"cl:start:{phone}")],
               [("📤 Export session", f"a:exp:{phone}"), ("🗑 Remove", f"a:rm:{phone}")],
               [("🚪 Logout everywhere", f"a:lo:{phone}")],
               [("⬅️ Accounts", "a:l"), ("🏠 Menu", "m")]]
@@ -472,6 +634,10 @@ class SessionManagerBot:
             return await self.login_phone(text)
         if login and login.get("stage") == "pw" and not cmd.startswith("/"):
             return await self.login_password(text)
+        clone = self.mgr.clone
+        if clone and clone.get("stage") == "pw" and not cmd.startswith("/"):
+            done, msg = await self.mgr.clone_sign_in_password(text)
+            return msg, (_nav() if done else [[("Cancel", "cl:x")]])
         return "Use the buttons (/menu).", _nav()
 
     def arm_login(self) -> None:
@@ -524,6 +690,26 @@ class SessionManagerBot:
             return await self.ui_account(p)
         if k == "lg":
             return await self.ui_login(p)
+        if k == "cl":
+            return await self.ui_clone(p)
+        return main_screen(self.mgr)
+
+    async def ui_clone(self, p: list[str]) -> Reply | None:
+        sub = p[1] if len(p) > 1 else ""
+        if sub == "x":
+            await self.mgr._cleanup_clone()
+            return "Cancelled.", _nav()
+        if sub == "start":
+            key = p[2]
+            if self.mgr.clone:
+                return "A clone is already in progress. Cancel it first.", [[("Cancel", "cl:x")]]
+            ok, info = await self.mgr.start_clone(key)
+            if not ok:
+                return account_card(self.mgr, key, f"❌ {info}")
+            asyncio.create_task(self.mgr.run_clone_wait())
+            name = (self.mgr.store.d["accounts"].get(key) or {}).get("name") or key
+            return (f"🧬 Cloning <b>{html.escape(name)}</b>…\n📡 Waiting for the code - read automatically from its existing session, "
+                    f"nothing to type or see. This can take up to {int(CLONE_WAIT)}s; I'll message you the result."), [[("Cancel", "cl:x")]]
         return main_screen(self.mgr)
 
     async def ui_account(self, p: list[str]) -> Reply | None:
@@ -752,8 +938,9 @@ async def main() -> int:
 
     @dp.message(F.text, F.chat.type == "private")
     async def on_text(m: Message):
+        was_clone_pw = bool(mgr.clone and mgr.clone.get("stage") == "pw")   # capture before handle() can resolve (and clear) it
         res = await sb.handle(m.from_user.id, m.text)
-        if mgr.login:
+        if mgr.login or was_clone_pw:
             try:
                 await m.delete()                                          # phone / password must not stay in the chat
             except Exception:                                             # noqa: BLE001
