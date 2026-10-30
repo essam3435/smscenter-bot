@@ -38,6 +38,11 @@ LOGIN_TTL = 300                      # a half-finished phone login is forgotten 
 CLONE_WAIT = 45.0                    # seconds to wait for the code, auto-read off the source account's own session
 CLONE_TTL = 300                      # a half-finished clone (e.g. stuck on a 2FA password) is given up after this long
 TG_SERVICE_CHAT = 777000             # Telegram's own "Telegram" service notifications account
+HEALTH_INTERVAL = 1800.0             # how often the background health-check sweeps every account (30 min)
+HEALTH_GAP = 2.0                     # seconds between each account's own check within a sweep, so a big pool doesn't open 100 connections at once
+HEALTH_STALE = HEALTH_INTERVAL * 2   # a health reading older than this counts as "not checked recently" (🟡), not "healthy"
+EVENT_ICON = {"import": "📥", "clone": "🧬", "kill": "🔴", "kill_all": "🧹", "logout": "🚪", "remove": "🗑",
+              "watch": "📡", "code": "📩", "health": "🩺"}
 
 KB = list[list[tuple[str, str]]]
 Reply = tuple[str, "KB | None"]
@@ -172,11 +177,22 @@ class Store:
         except (OSError, ValueError):
             return ""
 
-    def save(self) -> None:
+    def save(self, throttle: float = 0.0) -> None:
+        now = time.time()
+        if throttle and now - getattr(self, "_saved", 0.0) < throttle:
+            return
+        self._saved = now
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.d, f, indent=1, ensure_ascii=False)
         os.replace(tmp, self.path)
+
+    def log(self, key: str, kind: str, text: str) -> None:
+        """Persisted activity record (never put a code or any other secret in text). The admin is always the actor - single-admin bot, no attribution needed."""
+        ev = self.d.setdefault("events", [])
+        ev.append({"t": int(time.time()), "key": key, "k": kind, "x": str(text)[:200]})
+        del ev[:-500]
+        self.save(5.0)
 
 
 # ── the manager: one TelegramClient per account that is being watched, short-lived ones otherwise ───────
@@ -189,6 +205,7 @@ class Manager:
         self.login_timer: asyncio.TimerHandle | None = None
         self.clone: dict | None = None             # the one in-progress clone (single admin): read the code from the SOURCE account's own session
         self.clone_timer: asyncio.TimerHandle | None = None
+        self.health_task: asyncio.Task | None = None
         os.makedirs(SESS_DIR, exist_ok=True)
 
     def base(self, phone: str) -> str:
@@ -265,6 +282,7 @@ class Manager:
         async def _on_msg(ev):                                           # noqa: ANN001
             text = (ev.raw_text or "").strip()
             if text:
+                self.store.log(phone, "code", "relayed")                 # never the text itself: it's the login code
                 await self.notify(f"📩 <b>{html.escape(name)}</b> ({html.escape(phone)})\n{html.escape(text)}")
 
         try:
@@ -292,6 +310,12 @@ class Manager:
         for phone in list(self.watch_tasks):
             await self.stop_watch(phone)
         await self._cleanup_clone()
+        if self.health_task and not self.health_task.done():
+            self.health_task.cancel()
+            try:
+                await self.health_task
+            except (asyncio.CancelledError, Exception):                 # noqa: BLE001
+                pass
 
     # -- import
     async def import_file(self, local_path: str) -> tuple[str | None, str]:
@@ -323,7 +347,9 @@ class Manager:
         who = (me.first_name or "") + (f" (@{me.username})" if me.username else "")
         acc = self.store.d["accounts"].setdefault(phone, {})
         acc["added_at"], acc["name"], acc["phone"] = acc.get("added_at") or time.time(), who.strip() or phone, phone
+        acc["health"], acc["checked_at"] = "ok", time.time()           # it was just proven authorized above
         self.store.save()
+        self.store.log(phone, "import", "updated" if existed else "added")
         return phone, f"{'Updated' if existed else 'Added'} <b>{html.escape(who.strip() or phone)}</b> ({html.escape(phone)})."
 
     async def import_zip(self, zpath: str) -> list[str]:
@@ -349,27 +375,74 @@ class Manager:
         return out
 
     # -- per-account actions
-    async def validate(self, phone: str) -> str:
+    async def check_health(self, phone: str) -> tuple[str, str]:
+        """-> (code, detail). code: 'ok' | 'invalid' | 'banned' | 'connect_error' | 'error'. Used by the Validate button and the background sweep."""
         from telethon.errors import AuthKeyUnregisteredError, UserDeactivatedBanError, UserDeactivatedError
         try:
             c, mine = await self.client_for(phone)
         except Exception as e:                                           # noqa: BLE001
-            return f"❌ Couldn't connect ({html.escape(type(e).__name__)})."
+            return "connect_error", type(e).__name__
         try:
             if not await c.is_user_authorized():
-                return "❌ Not logged in any more."
+                return "invalid", ""
             me = await c.get_me()
             who = (me.first_name or "") + (f" (@{me.username})" if me.username else "")
-            return f"✅ Still logged in as <b>{html.escape(who.strip())}</b>."
+            return "ok", who.strip()
         except AuthKeyUnregisteredError:
-            return "❌ Logged out on Telegram's side (auth key no longer valid)."
+            return "invalid", ""
         except (UserDeactivatedError, UserDeactivatedBanError):
-            return "❌ This account is deactivated or banned."
+            return "banned", ""
         except Exception as e:                                           # noqa: BLE001
-            return f"❌ Couldn't check it: {html.escape(type(e).__name__)}."
+            return "error", type(e).__name__
         finally:
             if mine:
                 await c.disconnect()
+
+    def record_health(self, phone: str, code: str) -> bool:
+        """Persists the latest health reading and logs a real transition. -> True only for a NEW bad transition (worth alerting on)."""
+        acc = self.store.d["accounts"].get(phone)
+        if acc is None:
+            return False
+        was_bad, is_bad = acc.get("health") in ("invalid", "banned"), code in ("invalid", "banned")
+        acc["health"], acc["checked_at"] = code, time.time()
+        self.store.save(5.0)
+        if is_bad and not was_bad:
+            self.store.log(phone, "health", f"went {code}")
+            return True
+        if code == "ok" and was_bad:
+            self.store.log(phone, "health", "recovered")
+        return False
+
+    async def validate(self, phone: str) -> str:
+        code, info = await self.check_health(phone)
+        self.record_health(phone, code)
+        return {"ok": f"✅ Still logged in as <b>{html.escape(info)}</b>.", "invalid": "❌ Not logged in any more.",
+                "banned": "❌ This account is deactivated or banned.", "connect_error": f"❌ Couldn't connect ({html.escape(info)}).",
+                "error": f"❌ Couldn't check it: {html.escape(info)}."}[code]
+
+    async def health_loop(self) -> None:
+        """Every HEALTH_INTERVAL, re-checks every account (gaps between accounts so a big pool doesn't open 100 connections at once);
+        DMs the admin the moment one newly goes invalid/banned instead of them finding out next time they tap it."""
+        while True:
+            try:
+                await asyncio.sleep(HEALTH_INTERVAL)
+            except asyncio.CancelledError:
+                raise
+            for phone in list(self.store.d["accounts"]):
+                if phone not in self.store.d["accounts"]:                # removed mid-sweep
+                    continue
+                try:
+                    code, _info = await self.check_health(phone)
+                except Exception:                                        # noqa: BLE001
+                    code = "error"
+                if self.record_health(phone, code):
+                    name = self.store.d["accounts"][phone].get("name") or phone
+                    await self.notify(f"🩺 <b>{html.escape(name)}</b> ({html.escape(phone)}) is now <b>{code}</b> - its Telegram session stopped working.")
+                await asyncio.sleep(HEALTH_GAP)
+
+    def start_health(self) -> None:
+        if self.health_task is None or self.health_task.done():
+            self.health_task = asyncio.create_task(self.health_loop())
 
     async def sessions_of(self, phone: str) -> tuple[list, str | None]:
         """-> (list of telethon Authorization objects, error or None)."""
@@ -395,6 +468,7 @@ class Manager:
             return f"❌ Couldn't connect ({html.escape(type(e).__name__)})."
         try:
             await c(ResetAuthorizationRequest(hash=auth_hash))
+            self.store.log(phone, "kill", "ended one other device")
             return "✅ That device is logged out."
         except Exception as e:                                           # noqa: BLE001
             return f"❌ Couldn't end it: {html.escape(type(e).__name__)}."
@@ -411,6 +485,7 @@ class Manager:
             return f"❌ Couldn't connect ({html.escape(type(e).__name__)})."
         try:
             await c(ResetAuthorizationsRequest())
+            self.store.log(phone, "kill_all", "ended every other device")
             return "✅ Every other device is logged out. Only this bot's session remains."
         except FloodWaitError as e:
             return f"⏳ Telegram limits this to about once a day - wait {e.seconds}s and try again."
@@ -430,6 +505,7 @@ class Manager:
             await c.log_out()
         except Exception as e:                                           # noqa: BLE001
             return f"❌ Logout failed: {html.escape(type(e).__name__)}."
+        self.store.log(phone, "logout", "logged out everywhere")
         self.remove(phone)
         return "🚪 Logged out everywhere and removed from the bot."
 
@@ -501,6 +577,7 @@ class Manager:
                       "new_key": new_key, "new_client": new_c, "hash": sent.phone_code_hash, "future": fut,
                       "handler": _catch, "stage": "code"}
         self.arm_clone()
+        self.store.log(source_key, "clone", f"started -> {new_key}")
         return True, new_key
 
     async def run_clone_wait(self) -> None:
@@ -512,6 +589,7 @@ class Manager:
         try:
             code = await asyncio.wait_for(clone["future"], CLONE_WAIT)
         except asyncio.TimeoutError:
+            self.store.log(clone["source_key"], "clone", f"{clone['new_key']} timed out")
             await self.notify(f"⌛ Clone of <code>{html.escape(clone['phone'])}</code> timed out - no code arrived within {int(CLONE_WAIT)}s.")
             await self._cleanup_clone()
             return
@@ -524,6 +602,7 @@ class Manager:
                               "Send its password in this chat. I delete your message right after.")
             return
         except Exception as e:                                           # noqa: BLE001
+            self.store.log(clone["source_key"], "clone", f"{clone['new_key']} failed: {type(e).__name__}")
             await self.notify(f"❌ Clone of <code>{html.escape(clone['phone'])}</code> failed: {html.escape(type(e).__name__)}.")
             await self._cleanup_clone()
             return
@@ -556,8 +635,9 @@ class Manager:
             pass
         await self._teardown_clone()
         self.store.d["accounts"][clone["new_key"]] = {"watch": False, "added_at": time.time(), "name": who.strip() or clone["phone"],
-                                                        "phone": clone["phone"], "clone_of": clone["source_key"]}
+                                                        "phone": clone["phone"], "clone_of": clone["source_key"], "health": "ok", "checked_at": time.time()}
         self.store.save()
+        self.store.log(clone["source_key"], "clone", f"{clone['new_key']} ready")
         await self.notify(f"🧬 Clone ready: <b>{html.escape(who.strip())}</b> ({html.escape(clone['phone'])}) is now its own, separate session "
                           f"(<code>{html.escape(clone['new_key'])}</code>), alongside the one it was cloned from.")
 
@@ -601,11 +681,36 @@ def _nav() -> KB:
     return [[("🏠 Menu", "m")]]
 
 
+def health_dot(acc: dict) -> str:
+    """🟢 healthy and checked recently · 🔴 invalid/banned · 🟡 unknown, never checked, or stale."""
+    h = acc.get("health")
+    if h in ("invalid", "banned"):
+        return "🔴"
+    if h == "ok" and time.time() - (acc.get("checked_at") or 0) < HEALTH_STALE:
+        return "🟢"
+    return "🟡"
+
+
+def health_word(acc: dict) -> str:
+    h = acc.get("health")
+    if h in ("invalid", "banned"):
+        return f"🔴 {h}"
+    if h == "ok":
+        return f"🟢 ok (checked {ago(acc['checked_at'])})" if acc.get("checked_at") else "🟡 not checked yet"
+    return "🟡 not checked yet" if not acc.get("checked_at") else f"🟡 unclear (checked {ago(acc['checked_at'])})"
+
+
 def main_screen(mgr: Manager) -> Reply:
     accs = mgr.store.d["accounts"]
-    txt = (f"🔐 <b>Session manager</b>\n{len(accs)} account{'s' if len(accs) != 1 else ''} · "
-           f"{sum(1 for a in accs.values() if a.get('watch'))} being watched for codes")
-    kb: KB = [[("📂 Accounts", "a:l")], [("➕ Add account", "a:add")]]
+    groups = account_groups(mgr)
+    bad = sum(1 for a in accs.values() if a.get("health") in ("invalid", "banned"))
+    day_ago = time.time() - 86400
+    codes_today = sum(1 for e in mgr.store.d.get("events", []) if e["k"] == "code" and e["t"] > day_ago)
+    txt = (f"🔐 <b>Session manager</b>\n{len(groups)} account{'s' if len(groups) != 1 else ''} · {len(accs)} session{'s' if len(accs) != 1 else ''} total · "
+           f"{sum(1 for a in accs.values() if a.get('watch'))} watched\n"
+           + (f"⚠️ {bad} need attention\n" if bad else "")
+           + f"📩 {codes_today} code{'s' if codes_today != 1 else ''} today")
+    kb: KB = [[("📂 Accounts", "a:l")], [("➕ Add account", "a:add"), ("🧾 Activity", "ev:l")]]
     return txt, kb
 
 
@@ -623,6 +728,12 @@ def account_groups(mgr: Manager) -> dict[str, list[str]]:
     return groups
 
 
+def group_dot(mgr: Manager, keys: list[str]) -> str:
+    """The worst status among a group's sessions - one bad clone is enough to flag the whole row."""
+    dots = [health_dot(mgr.store.d["accounts"][k]) for k in keys]
+    return "🔴" if "🔴" in dots else "🟡" if "🟡" in dots else "🟢"
+
+
 def accounts_screen(mgr: Manager) -> Reply:
     accs = mgr.store.d["accounts"]
     if not accs:
@@ -633,11 +744,11 @@ def accounts_screen(mgr: Manager) -> Reply:
         primary = accs[keys[0]]
         name = primary.get("name") or phone
         cc = guess_cc(phone)
-        label = f"{flag(cc)}" + (f" {cc.upper()}" if cc else "") + f" · {name[:16]} · {phone} · {len(keys)} 🔐"
+        label = f"{group_dot(mgr, keys)}{flag(cc)}" + (f" {cc.upper()}" if cc else "") + f" · {name[:16]} · {phone} · {len(keys)} 🔐"
         kb.append([(label[:64], f"a:v:{keys[0]}" if len(keys) == 1 else f"a:g:{phone}")])
     kb.append([("➕ Add account", "a:add")])
     kb.append([("🏠 Menu", "m")])
-    return f"📂 <b>Accounts</b> ({len(groups)})\n<i>the number = sessions on that account (original + clones) - tap to pick one</i>", kb
+    return f"📂 <b>Accounts</b> ({len(groups)})\n<i>🟢 healthy · 🟡 check pending · 🔴 needs attention - the number = sessions on that account</i>", kb
 
 
 def group_screen(mgr: Manager, phone: str) -> Reply:
@@ -652,8 +763,8 @@ def group_screen(mgr: Manager, phone: str) -> Reply:
     for i, k in enumerate(keys):
         a = accs[k]
         tag = "Original" if not a.get("clone_of") else f"Clone #{i + 1}"
-        dot = "📡" if a.get("watch") else "⚪"
-        kb.append([(f"{dot} {tag} · added {ago(a.get('added_at') or time.time())}", f"a:v:{k}")])
+        watch = "📡" if a.get("watch") else "⚪"
+        kb.append([(f"{health_dot(a)}{watch} {tag} · added {ago(a.get('added_at') or time.time())}", f"a:v:{k}")])
     kb.append([("⬅️ Accounts", "a:l"), ("🏠 Menu", "m")])
     cc = guess_cc(phone)
     return (f"{flag(cc)}" + (f" {cc.upper()}" if cc else "") + f" · <b>{html.escape(name)}</b> · <code>{html.escape(phone)}</code>\n"
@@ -669,17 +780,39 @@ def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
     src_name = (mgr.store.d["accounts"].get(src) or {}).get("name") if src else None
     txt = (f"👤 <b>{html.escape(acc.get('name') or phone)}</b>\n📞 <code>{html.escape(acc.get('phone') or phone)}</code>\n"
            + (f"🧬 Clone of {html.escape(src_name or src)}\n" if src else "")
-           + f"Added {ago(acc.get('added_at') or time.time())}\n📡 OTP watch: {'ON' if watch else 'off'}"
+           + f"Added {ago(acc.get('added_at') or time.time())}\n🩺 Health: {health_word(acc)}\n📡 OTP watch: {'ON' if watch else 'off'}"
            + (f"\n\n{note}" if note else ""))
     group = group_of(phone, acc)
     back = ("⬅️ Sessions on this account", f"a:g:{group}") if len(account_groups(mgr).get(group, [])) > 1 else ("⬅️ Accounts", "a:l")
     kb: KB = [[("🔁 Validate", f"a:val:{phone}"), ("📟 Sessions", f"a:s:{phone}:0")],
               [(("📡 Watch: ON" if watch else "📡 Watch: off"), f"a:w:{phone}")],
               [("🧬 Clone session", f"cl:start:{phone}")],
+              [("🧾 Activity", f"ev:l:{phone}:0")],
               [("📤 Export session", f"a:exp:{phone}"), ("🗑 Remove", f"a:rm:{phone}")],
               [("🚪 Logout everywhere", f"a:lo:{phone}")],
               [back, ("🏠 Menu", "m")]]
     return txt, kb
+
+
+def events_screen(mgr: Manager, page: int, filter_key: str | None) -> Reply:
+    evs = [e for e in reversed(mgr.store.d.get("events", [])) if filter_key is None or e["key"] == filter_key]
+    per = 12
+    pages = max(1, (len(evs) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    part = evs[page * per:(page + 1) * per]
+    base = "ev:l" if filter_key is None else f"ev:l:{filter_key}"
+    rows = [f"{EVENT_ICON.get(e['k'], '•')} <b>{ago(e['t'])}</b>" + ("" if filter_key else f" · <code>{html.escape(e['key'])}</code>") + f"\n    {html.escape(e['x'])}"
+            for e in part]
+    nav = []
+    if page > 0:
+        nav.append(("⬅️", f"{base}:{page - 1}"))
+    nav.append((f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(("➡️", f"{base}:{page + 1}"))
+    back = ("⬅️ Account", f"a:v:{filter_key}") if filter_key else ("🏠 Menu", "m")
+    kb: KB = [nav, [("🔄 Refresh", f"{base}:{page}"), back]]
+    who = f" for <code>{html.escape(filter_key)}</code>" if filter_key else ""
+    return f"🧾 <b>Activity</b>{who} ({len(evs)}, newest first)\n" + ("\n".join(rows) or "nothing yet"), kb
 
 
 def sessions_screen(phone: str, auths: list, page: int) -> Reply:
@@ -793,6 +926,15 @@ class SessionManagerBot:
             return await self.ui_login(p)
         if k == "cl":
             return await self.ui_clone(p)
+        if k == "ev":
+            sub = p[1] if len(p) > 1 else "l"
+            if sub == "l" and len(p) == 2:                               # ev:l -> global activity, page 0
+                return events_screen(self.mgr, 0, None)
+            if sub == "l" and len(p) == 3:                               # ev:l:<page>
+                return events_screen(self.mgr, int(p[2]), None)
+            if sub == "l" and len(p) == 4:                               # ev:l:<key>:<page> -> that account's own activity
+                return events_screen(self.mgr, int(p[3]), p[2])
+            return events_screen(self.mgr, 0, None)
         return main_screen(self.mgr)
 
     async def ui_clone(self, p: list[str]) -> Reply | None:
@@ -834,6 +976,7 @@ class SessionManagerBot:
                 return accounts_screen(self.mgr)
             acc["watch"] = not acc.get("watch")
             self.mgr.store.save()
+            self.mgr.store.log(phone, "watch", "on" if acc["watch"] else "off")
             if acc["watch"]:
                 await self.mgr.start_watch(phone)
             else:
@@ -860,6 +1003,7 @@ class SessionManagerBot:
                    [[("✅ Yes, remove", f"a:rmy:{p[2]}"), ("Cancel", f"a:v:{p[2]}")]]
         if sub == "rmy":
             await self.mgr.stop_watch(p[2])
+            self.mgr.store.log(p[2], "remove", "removed from the bot (Telegram login untouched)")
             self.mgr.remove(p[2])
             return "🗑 Removed.", accounts_screen(self.mgr)[1]
         if sub == "lo":
@@ -1085,6 +1229,7 @@ async def main() -> int:
     except Exception as e:                                                # noqa: BLE001
         log.warning("start notice failed: %s", e)
     await mgr.resume()
+    mgr.start_health()
     try:
         await dp.start_polling(bot)
     finally:
