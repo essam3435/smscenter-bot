@@ -42,7 +42,8 @@ HEALTH_INTERVAL = 1800.0             # how often the background health-check swe
 HEALTH_GAP = 2.0                     # seconds between each account's own check within a sweep, so a big pool doesn't open 100 connections at once
 HEALTH_STALE = HEALTH_INTERVAL * 2   # a health reading older than this counts as "not checked recently" (🟡), not "healthy"
 EVENT_ICON = {"import": "📥", "clone": "🧬", "kill": "🔴", "kill_all": "🧹", "logout": "🚪", "remove": "🗑",
-              "watch": "📡", "code": "📩", "health": "🩺"}
+              "watch": "📡", "code": "📩", "health": "🩺", "validate_all": "🔁", "kill_all_everywhere": "🧹"}
+BULK_KEY = "*"                       # Store.log() key for an action that isn't about one account (a global sweep)
 
 KB = list[list[tuple[str, str]]]
 Reply = tuple[str, "KB | None"]
@@ -206,6 +207,7 @@ class Manager:
         self.clone: dict | None = None             # the one in-progress clone (single admin): read the code from the SOURCE account's own session
         self.clone_timer: asyncio.TimerHandle | None = None
         self.health_task: asyncio.Task | None = None
+        self.bulk_running: set[str] = set()        # which admin-triggered sweep ("val" / "kill") is in flight, to refuse a double-tap
         os.makedirs(SESS_DIR, exist_ok=True)
 
     def base(self, phone: str) -> str:
@@ -444,6 +446,42 @@ class Manager:
         if self.health_task is None or self.health_task.done():
             self.health_task = asyncio.create_task(self.health_loop())
 
+    async def validate_all(self) -> None:
+        """Admin-triggered sweep of every account right now (⏳ immediate reply, full summary DMed when done)."""
+        if "val" in self.bulk_running:
+            return
+        self.bulk_running.add("val")
+        try:
+            accs = list(self.store.d["accounts"])
+            ok = bad = err = 0
+            newly_bad = []
+            for phone in accs:
+                if phone not in self.store.d["accounts"]:               # removed mid-sweep
+                    continue
+                try:
+                    code, _info = await self.check_health(phone)
+                except Exception:                                        # noqa: BLE001
+                    code = "error"
+                if self.record_health(phone, code):
+                    newly_bad.append(phone)
+                if code == "ok":
+                    ok += 1
+                elif code in ("invalid", "banned"):
+                    bad += 1
+                else:
+                    err += 1
+                await asyncio.sleep(HEALTH_GAP)
+            self.store.d["last_validate_all"] = time.time()
+            self.store.save()
+            self.store.log(BULK_KEY, "validate_all", f"{ok} ok, {bad} bad, {err} couldn't check ({len(accs)} total)")
+            lines = [f"✅ <b>Validate all</b> done: {ok} ok, {bad} bad, {err} couldn't check ({len(accs)} total)."]
+            if newly_bad:
+                names = [html.escape((self.store.d['accounts'].get(p) or {}).get('name') or p) for p in newly_bad]
+                lines.append("⚠️ Newly bad: " + ", ".join(names))
+            await self.notify("\n".join(lines))
+        finally:
+            self.bulk_running.discard("val")
+
     async def sessions_of(self, phone: str) -> tuple[list, str | None]:
         """-> (list of telethon Authorization objects, error or None)."""
         from telethon.tl.functions.account import GetAuthorizationsRequest
@@ -494,6 +532,38 @@ class Manager:
         finally:
             if mine:
                 await c.disconnect()
+
+    async def kill_all_others_everywhere(self) -> None:
+        """Admin-triggered: end every OTHER device on every account right now. Each account's own bot session stays untouched."""
+        if "kill" in self.bulk_running:
+            return
+        self.bulk_running.add("kill")
+        try:
+            accs = list(self.store.d["accounts"])
+            done = flood = failed = 0
+            notes = []
+            for phone in accs:
+                if phone not in self.store.d["accounts"]:               # removed mid-sweep
+                    continue
+                msg = await self.end_all_others(phone)
+                name = (self.store.d["accounts"][phone].get("name") or phone)
+                if msg.startswith("✅"):
+                    done += 1
+                elif msg.startswith("⏳"):
+                    flood += 1
+                    notes.append(f"⏳ {html.escape(name)}: rate-limited (~once/day)")
+                else:
+                    failed += 1
+                    notes.append(f"❌ {html.escape(name)}: {msg}")
+                await asyncio.sleep(HEALTH_GAP)
+            self.store.d["last_kill_all"] = time.time()
+            self.store.save()
+            self.store.log(BULK_KEY, "kill_all_everywhere", f"{done} cleared, {flood} rate-limited, {failed} failed ({len(accs)} total)")
+            lines = [f"🧹 <b>Kill others (all accounts)</b> done: {done} cleared, {flood} rate-limited, {failed} failed ({len(accs)} total)."]
+            lines.extend(notes[:15])
+            await self.notify("\n".join(lines))
+        finally:
+            self.bulk_running.discard("kill")
 
     async def logout(self, phone: str) -> str:
         await self.stop_watch(phone)
@@ -701,16 +771,20 @@ def health_word(acc: dict) -> str:
 
 
 def main_screen(mgr: Manager) -> Reply:
-    accs = mgr.store.d["accounts"]
+    d = mgr.store.d
+    accs = d["accounts"]
     groups = account_groups(mgr)
     bad = sum(1 for a in accs.values() if a.get("health") in ("invalid", "banned"))
     day_ago = time.time() - 86400
-    codes_today = sum(1 for e in mgr.store.d.get("events", []) if e["k"] == "code" and e["t"] > day_ago)
+    codes_today = sum(1 for e in d.get("events", []) if e["k"] == "code" and e["t"] > day_ago)
     txt = (f"🔐 <b>Session manager</b>\n{len(groups)} account{'s' if len(groups) != 1 else ''} · {len(accs)} session{'s' if len(accs) != 1 else ''} total · "
            f"{sum(1 for a in accs.values() if a.get('watch'))} watched\n"
            + (f"⚠️ {bad} need attention\n" if bad else "")
-           + f"📩 {codes_today} code{'s' if codes_today != 1 else ''} today")
-    kb: KB = [[("📂 Accounts", "a:l")], [("➕ Add account", "a:add"), ("🧾 Activity", "ev:l")]]
+           + f"📩 {codes_today} code{'s' if codes_today != 1 else ''} today"
+           + (f"\n🔁 Last validate all: {ago(d['last_validate_all'])}" if d.get("last_validate_all") else "")
+           + (f"\n🧹 Last kill-all sweep: {ago(d['last_kill_all'])}" if d.get("last_kill_all") else ""))
+    kb: KB = [[("📂 Accounts", "a:l")], [("➕ Add account", "a:add"), ("🧾 Activity", "ev:l")],
+              [("✅ Validate all", "ga:val"), ("🧹 Kill others (all)", "ga:kill")]]
     return txt, kb
 
 
@@ -926,6 +1000,8 @@ class SessionManagerBot:
             return await self.ui_login(p)
         if k == "cl":
             return await self.ui_clone(p)
+        if k == "ga":
+            return await self.ui_global(p)
         if k == "ev":
             sub = p[1] if len(p) > 1 else "l"
             if sub == "l" and len(p) == 2:                               # ev:l -> global activity, page 0
@@ -953,6 +1029,31 @@ class SessionManagerBot:
             name = (self.mgr.store.d["accounts"].get(key) or {}).get("name") or key
             return (f"🧬 Cloning <b>{html.escape(name)}</b>…\n📡 Waiting for the code - read automatically from its existing session, "
                     f"nothing to type or see. This can take up to {int(CLONE_WAIT)}s; I'll message you the result."), [[("Cancel", "cl:x")]]
+        return main_screen(self.mgr)
+
+    async def ui_global(self, p: list[str]) -> Reply | None:
+        sub = p[1] if len(p) > 1 else ""
+        n = len(self.mgr.store.d["accounts"])
+        if sub == "val":
+            if n == 0:
+                return "No accounts to validate.", _nav()
+            if "val" in self.mgr.bulk_running:
+                return "A validate-all sweep is already running.", _nav()
+            asyncio.create_task(self.mgr.validate_all())
+            return f"⏳ Validating all {n} account{'s' if n != 1 else ''} in the background. I'll DM a summary when it's done.", _nav()
+        if sub == "kill":
+            if n == 0:
+                return "No accounts to act on.", _nav()
+            return (f"🧹 Log out every <b>OTHER</b> device on all {n} account{'s' if n != 1 else ''}? Each account's own bot session stays. "
+                    "Telegram limits this to about once a day per account - any account hit recently will just report a wait."), \
+                   [[("✅ Yes, kill all", "ga:killy"), ("Cancel", "m")]]
+        if sub == "killy":
+            if n == 0:
+                return "No accounts to act on.", _nav()
+            if "kill" in self.mgr.bulk_running:
+                return "A kill-all sweep is already running.", _nav()
+            asyncio.create_task(self.mgr.kill_all_others_everywhere())
+            return f"⏳ Killing other sessions on all {n} account{'s' if n != 1 else ''} in the background. I'll DM a summary when it's done.", _nav()
         return main_screen(self.mgr)
 
     async def ui_account(self, p: list[str]) -> Reply | None:
