@@ -85,8 +85,9 @@ def _admin_id() -> int | None:
 
 
 def creds() -> tuple[int, str] | None:
-    """(api_id, api_hash) - the same Telegram credentials smscenter-bot's checker uses (same repo secrets)."""
-    api_id, api_hash = os.environ.get("TG_API_ID", "").strip(), os.environ.get("TG_API_HASH", "").strip()
+    """(api_id, api_hash) - the same Telegram credentials smscenter-bot's checker uses (same repo secrets).
+    GitHub's secret editor can leave a BOM on a pasted value, which plain .strip() does not remove."""
+    api_id, api_hash = (os.environ.get(k, "").strip().lstrip("\ufeff").strip() for k in ("TG_API_ID", "TG_API_HASH"))
     return (int(api_id), api_hash) if api_id.isdigit() and api_hash else None
 
 
