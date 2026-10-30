@@ -104,6 +104,48 @@ def pre(lines: list[str]) -> str:
     return "<pre>" + html.escape("\n".join(lines)) + "</pre>" if lines else ""
 
 
+# International calling code -> ISO-2, longest prefix first; common countries only, 🌐 for anything else.
+_CALLING_CODES = {
+    "1242": "bs", "1246": "bb", "1264": "ai", "1268": "ag", "1284": "vg", "1340": "vi", "1345": "ky", "1441": "bm",
+    "1473": "gd", "1649": "tc", "1664": "ms", "1670": "mp", "1671": "gu", "1684": "as", "1758": "lc", "1767": "dm",
+    "1784": "vc", "1787": "pr", "1809": "do", "1868": "tt", "1869": "kn", "1876": "jm", "1939": "pr",
+    "1": "us", "20": "eg", "211": "ss", "212": "ma", "213": "dz", "216": "tn", "218": "ly", "220": "gm", "221": "sn",
+    "222": "mr", "223": "ml", "224": "gn", "225": "ci", "226": "bf", "227": "ne", "228": "tg", "229": "bj",
+    "230": "mu", "231": "lr", "232": "sl", "233": "gh", "234": "ng", "235": "td", "236": "cf", "237": "cm",
+    "238": "cv", "239": "st", "240": "gq", "241": "ga", "242": "cg", "243": "cd", "244": "ao", "245": "gw",
+    "248": "sc", "249": "sd", "250": "rw", "251": "et", "252": "so", "253": "dj", "254": "ke", "255": "tz",
+    "256": "ug", "257": "bi", "258": "mz", "260": "zm", "261": "mg", "262": "re", "263": "zw", "264": "na",
+    "265": "mw", "266": "ls", "267": "bw", "268": "sz", "269": "km", "27": "za", "30": "gr", "31": "nl",
+    "32": "be", "33": "fr", "34": "es", "36": "hu", "39": "it", "40": "ro", "41": "ch", "420": "cz",
+    "421": "sk", "423": "li", "43": "at", "44": "gb", "45": "dk", "46": "se", "47": "no", "48": "pl",
+    "49": "de", "351": "pt", "352": "lu", "353": "ie", "354": "is", "355": "al", "356": "mt", "357": "cy",
+    "358": "fi", "359": "bg", "370": "lt", "371": "lv", "372": "ee", "373": "md", "374": "am", "375": "by",
+    "376": "ad", "377": "mc", "378": "sm", "380": "ua", "381": "rs", "382": "me", "383": "xk", "385": "hr",
+    "386": "si", "387": "ba", "389": "mk", "51": "pe", "52": "mx", "53": "cu", "54": "ar", "55": "br",
+    "56": "cl", "57": "co", "58": "ve", "590": "gp", "591": "bo", "592": "gy", "593": "ec", "595": "py",
+    "598": "uy", "60": "my", "61": "au", "62": "id", "63": "ph", "64": "nz", "65": "sg", "66": "th",
+    "7": "ru", "81": "jp", "82": "kr", "84": "vn", "852": "hk", "853": "mo", "855": "kh", "856": "la",
+    "86": "cn", "880": "bd", "886": "tw", "90": "tr", "91": "in", "92": "pk", "93": "af", "94": "lk",
+    "95": "mm", "960": "mv", "961": "lb", "962": "jo", "963": "sy", "964": "iq", "965": "kw", "966": "sa",
+    "967": "ye", "968": "om", "970": "ps", "971": "ae", "972": "il", "973": "bh", "974": "qa", "975": "bt",
+    "976": "mn", "977": "np", "98": "ir",
+}
+
+
+def guess_cc(phone: str) -> str:
+    """ISO-2 country code guessed from a phone's leading digits (longest match wins); '' if nothing matches."""
+    digits = re.sub(r"\D", "", phone)
+    for n in (4, 3, 2, 1):
+        if digits[:n] in _CALLING_CODES:
+            return _CALLING_CODES[digits[:n]]
+    return ""
+
+
+def flag(cc: str) -> str:
+    cc = cc.lower()
+    return chr(0x1F1E6 + ord(cc[0]) - 97) + chr(0x1F1E6 + ord(cc[1]) - 97) if re.fullmatch(r"[a-z]{2}", cc) else "🌐"
+
+
 class Store:
     def __init__(self, path: str):
         self.path = path
@@ -567,17 +609,53 @@ def main_screen(mgr: Manager) -> Reply:
     return txt, kb
 
 
+def group_of(key: str, acc: dict) -> str:
+    """The real phone number an account key belongs to (a clone's own key is '<phone>#2', '#3', ...)."""
+    return acc.get("phone") or key.split("#")[0]
+
+
+def account_groups(mgr: Manager) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for key, acc in mgr.store.d["accounts"].items():
+        groups.setdefault(group_of(key, acc), []).append(key)
+    for keys in groups.values():
+        keys.sort(key=lambda k: mgr.store.d["accounts"][k].get("added_at") or 0)   # the original session first, then its clones in order
+    return groups
+
+
 def accounts_screen(mgr: Manager) -> Reply:
     accs = mgr.store.d["accounts"]
     if not accs:
         return "📂 <b>Accounts</b>\nNone yet. Add one below.", [[("➕ Add account", "a:add")], [("🏠 Menu", "m")]]
+    groups = account_groups(mgr)
     kb: KB = []
-    for phone, acc in sorted(accs.items(), key=lambda kv: -(kv[1].get("added_at") or 0)):
-        dot = "🧬" if acc.get("clone_of") else "📡" if acc.get("watch") else "⚪"
-        kb.append([(f"{dot} {(acc.get('name') or phone)[:24]}", f"a:v:{phone}")])
+    for phone, keys in sorted(groups.items(), key=lambda kv: -max(accs[k].get("added_at") or 0 for k in kv[1])):
+        primary = accs[keys[0]]
+        name = primary.get("name") or phone
+        label = f"{flag(guess_cc(phone))} {name[:16]} {phone} · {len(keys)}"
+        kb.append([(label[:64], f"a:v:{keys[0]}" if len(keys) == 1 else f"a:g:{phone}")])
     kb.append([("➕ Add account", "a:add")])
     kb.append([("🏠 Menu", "m")])
-    return f"📂 <b>Accounts</b> ({len(accs)})\n<i>📡 = OTP watch on · 🧬 = a clone of another account</i>", kb
+    return f"📂 <b>Accounts</b> ({len(groups)})\n<i>the number = sessions on that account (original + clones) - tap to pick one</i>", kb
+
+
+def group_screen(mgr: Manager, phone: str) -> Reply:
+    accs = mgr.store.d["accounts"]
+    keys = account_groups(mgr).get(phone, [])
+    if not keys:
+        return "I don't manage that account any more.", [[("⬅️ Accounts", "a:l")]]
+    if len(keys) == 1:
+        return account_card(mgr, keys[0])
+    name = accs[keys[0]].get("name") or phone
+    kb: KB = []
+    for i, k in enumerate(keys):
+        a = accs[k]
+        tag = "Original" if not a.get("clone_of") else f"Clone #{i + 1}"
+        dot = "📡" if a.get("watch") else "⚪"
+        kb.append([(f"{dot} {tag} · added {ago(a.get('added_at') or time.time())}", f"a:v:{k}")])
+    kb.append([("⬅️ Accounts", "a:l"), ("🏠 Menu", "m")])
+    return (f"{flag(guess_cc(phone))} <b>{html.escape(name)}</b>  <code>{html.escape(phone)}</code>\n"
+            f"{len(keys)} sessions on this account - pick one to work on:"), kb
 
 
 def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
@@ -591,12 +669,14 @@ def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
            + (f"🧬 Clone of {html.escape(src_name or src)}\n" if src else "")
            + f"Added {ago(acc.get('added_at') or time.time())}\n📡 OTP watch: {'ON' if watch else 'off'}"
            + (f"\n\n{note}" if note else ""))
+    group = group_of(phone, acc)
+    back = ("⬅️ Sessions on this account", f"a:g:{group}") if len(account_groups(mgr).get(group, [])) > 1 else ("⬅️ Accounts", "a:l")
     kb: KB = [[("🔁 Validate", f"a:val:{phone}"), ("📟 Sessions", f"a:s:{phone}:0")],
               [(("📡 Watch: ON" if watch else "📡 Watch: off"), f"a:w:{phone}")],
               [("🧬 Clone session", f"cl:start:{phone}")],
               [("📤 Export session", f"a:exp:{phone}"), ("🗑 Remove", f"a:rm:{phone}")],
               [("🚪 Logout everywhere", f"a:lo:{phone}")],
-              [("⬅️ Accounts", "a:l"), ("🏠 Menu", "m")]]
+              [back, ("🏠 Menu", "m")]]
     return txt, kb
 
 
@@ -735,6 +815,8 @@ class SessionManagerBot:
         sub = p[1]
         if sub == "l":
             return accounts_screen(self.mgr)
+        if sub == "g":
+            return group_screen(self.mgr, p[2])
         if sub == "add":
             return ("➕ <b>Add account</b>\nSend a <code>.session</code> file, or a <code>.zip</code> of several, as a document. "
                     "Or log in with the phone number."), [[("📱 Login with phone", "lg:start")], [("⬅️ Menu", "m")]]
