@@ -91,8 +91,10 @@ def creds() -> tuple[int, str] | None:
     return (int(api_id), api_hash) if api_id.isdigit() and api_hash else None
 
 
-def ago(t: float) -> str:
-    d = max(0, int(time.time() - t))
+def ago(t) -> str:
+    """t: a Unix timestamp, or a datetime (Telethon returns date fields - date_active, date_created - as datetime objects, not floats)."""
+    epoch = t.timestamp() if hasattr(t, "timestamp") else float(t)
+    d = max(0, int(time.time() - epoch))
     return f"{d}s ago" if d < 60 else f"{d // 60}m ago" if d < 3600 else f"{d // 3600}h ago" if d < 86400 else f"{d // 86400}d ago"
 
 
@@ -772,7 +774,11 @@ async def main() -> int:
                 with open(path, "rb") as f:
                     await bot.send_document(q.from_user.id, BufferedInputFile(f.read(), os.path.basename(path)), caption="🔑 Treat this like a password.")
             return
-        res = await sb.ui(q.from_user.id, q.data or "")
+        try:
+            res = await sb.ui(q.from_user.id, q.data or "")
+        except Exception as e:                                           # noqa: BLE001  (never leave a tap with no visible response)
+            log.exception("button %s failed", q.data)
+            res = f"❌ That didn't work: {html.escape(type(e).__name__)}.", [[("🏠 Menu", "m")]]
         try:
             if res:
                 await q.message.edit_text(res[0], parse_mode="HTML", disable_web_page_preview=True, reply_markup=to_markup(res[1]))
