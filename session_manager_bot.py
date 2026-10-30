@@ -114,7 +114,16 @@ class Store:
 
     @property
     def token(self) -> str:
-        return os.environ.get("SESSIONBOT_TOKEN", "").strip() or unseal(self.d["token"])
+        env = os.environ.get("SESSIONBOT_TOKEN", "").strip()
+        if env:
+            return env
+        if self.d.get("token"):
+            return unseal(self.d["token"])
+        try:                                                              # fallback: a committed sessionbot_token.json (no secret needed)
+            with open(os.path.join(HERE, "sessionbot_token.json"), encoding="utf-8") as f:
+                return str(json.load(f).get("token") or "").strip()
+        except (OSError, ValueError):
+            return ""
 
     def save(self) -> None:
         tmp = self.path + ".tmp"
