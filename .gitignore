@@ -2,3 +2,5 @@
 *.session-journal
 state.json
 .smscenter_bot.json
+.sessionbot_state.json
+sessionbot_sessions/

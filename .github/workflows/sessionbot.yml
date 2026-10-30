@@ -1,0 +1,66 @@
+name: sessionbot
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: sessionbot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .sessionbot_state.json
+            sessionbot_sessions
+          key: sessionbot-state-never-matches
+          restore-keys: sessionbot-state
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          SESSIONBOT_TOKEN: ${{ secrets.SESSIONBOT_TOKEN }}
+          SESSIONBOT_STATE: .sessionbot_state.json
+          SESSIONBOT_SESSIONS_DIR: sessionbot_sessions
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          timeout --signal=INT --kill-after=60 330m python session_manager_bot.py || [ $? -eq 124 ]
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .sessionbot_state.json
+            sessionbot_sessions
+          key: sessionbot-state-${{ github.run_id }}
+
+      - name: Restart
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = await github.rest.actions.getWorkflowRun({owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId})
+            const mins = (Date.now() - new Date(run.data.run_started_at)) / 60000
+            if (mins < 10) { core.setFailed('bot exited after ' + mins.toFixed(1) + ' min, not restarting'); return }
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'sessionbot.yml',
+              ref: 'master'
+            })
