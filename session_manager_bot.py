@@ -632,7 +632,8 @@ def accounts_screen(mgr: Manager) -> Reply:
     for phone, keys in sorted(groups.items(), key=lambda kv: -max(accs[k].get("added_at") or 0 for k in kv[1])):
         primary = accs[keys[0]]
         name = primary.get("name") or phone
-        label = f"{flag(guess_cc(phone))} {name[:16]} {phone} · {len(keys)}"
+        cc = guess_cc(phone)
+        label = f"{flag(cc)}" + (f" {cc.upper()}" if cc else "") + f" · {name[:16]} · {phone} · {len(keys)} 🔐"
         kb.append([(label[:64], f"a:v:{keys[0]}" if len(keys) == 1 else f"a:g:{phone}")])
     kb.append([("➕ Add account", "a:add")])
     kb.append([("🏠 Menu", "m")])
@@ -654,7 +655,8 @@ def group_screen(mgr: Manager, phone: str) -> Reply:
         dot = "📡" if a.get("watch") else "⚪"
         kb.append([(f"{dot} {tag} · added {ago(a.get('added_at') or time.time())}", f"a:v:{k}")])
     kb.append([("⬅️ Accounts", "a:l"), ("🏠 Menu", "m")])
-    return (f"{flag(guess_cc(phone))} <b>{html.escape(name)}</b>  <code>{html.escape(phone)}</code>\n"
+    cc = guess_cc(phone)
+    return (f"{flag(cc)}" + (f" {cc.upper()}" if cc else "") + f" · <b>{html.escape(name)}</b> · <code>{html.escape(phone)}</code>\n"
             f"{len(keys)} sessions on this account - pick one to work on:"), kb
 
 
