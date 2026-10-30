@@ -42,7 +42,8 @@ HEALTH_INTERVAL = 1800.0             # how often the background health-check swe
 HEALTH_GAP = 2.0                     # seconds between each account's own check within a sweep, so a big pool doesn't open 100 connections at once
 HEALTH_STALE = HEALTH_INTERVAL * 2   # a health reading older than this counts as "not checked recently" (🟡), not "healthy"
 EVENT_ICON = {"import": "📥", "clone": "🧬", "kill": "🔴", "kill_all": "🧹", "logout": "🚪", "remove": "🗑",
-              "watch": "📡", "code": "📩", "health": "🩺", "validate_all": "🔁", "kill_all_everywhere": "🧹"}
+              "watch": "📡", "code": "📩", "health": "🩺", "validate_all": "🔁", "kill_all_everywhere": "🧹", "wipe": "💣"}
+WIPE_GAP = 0.3                       # seconds between each dialog deleted in a wipe, so a big chat list doesn't trip a flood limit
 BULK_KEY = "*"                       # Store.log() key for an action that isn't about one account (a global sweep)
 
 KB = list[list[tuple[str, str]]]
@@ -208,6 +209,7 @@ class Manager:
         self.clone_timer: asyncio.TimerHandle | None = None
         self.health_task: asyncio.Task | None = None
         self.bulk_running: set[str] = set()        # which admin-triggered sweep ("val" / "kill") is in flight, to refuse a double-tap
+        self.wiping: set[str] = set()              # phones currently mid-wipe, to refuse a double-tap on the same account
         os.makedirs(SESS_DIR, exist_ok=True)
 
     def base(self, phone: str) -> str:
@@ -565,6 +567,55 @@ class Manager:
         finally:
             self.bulk_running.discard("kill")
 
+    async def wipe_account(self, phone: str) -> tuple[int, int, list[str]]:
+        """Deletes every chat (both sides), leaves every group/channel/bot, and removes every contact. Irreversible;
+        the account itself stays logged in - only its chats/contacts/memberships go. -> (dialogs_cleared, contacts_removed, errors)."""
+        from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
+        try:
+            c, mine = await self.client_for(phone)
+        except Exception as e:                                           # noqa: BLE001
+            return 0, 0, [f"couldn't connect: {type(e).__name__}"]
+        cleared = 0
+        errors: list[str] = []
+        try:
+            async for d in c.iter_dialogs():
+                try:
+                    await c.delete_dialog(d.entity, revoke=True)
+                    cleared += 1
+                except Exception as e:                                   # noqa: BLE001
+                    errors.append(f"{html.escape((d.name or str(d.id))[:30])}: {type(e).__name__}")
+                await asyncio.sleep(WIPE_GAP)
+            removed = 0
+            try:
+                res = await c(GetContactsRequest(hash=0))
+                users = getattr(res, "users", [])
+                if users:
+                    await c(DeleteContactsRequest(id=users))
+                    removed = len(users)
+            except Exception as e:                                       # noqa: BLE001
+                errors.append(f"contacts: {type(e).__name__}")
+        finally:
+            if mine:
+                await c.disconnect()
+        return cleared, removed, errors
+
+    async def wipe_account_task(self, phone: str) -> None:
+        """Admin-triggered: run wipe_account() in the background and DM the result (⏳ immediate reply comes from the caller)."""
+        if phone in self.wiping:
+            return
+        self.wiping.add(phone)
+        try:
+            cleared, removed, errors = await self.wipe_account(phone)
+            name = (self.store.d["accounts"].get(phone) or {}).get("name") or phone
+            self.store.log(phone, "wipe", f"{cleared} dialogs cleared, {removed} contacts removed, {len(errors)} errors")
+            lines = [f"💣 <b>Wipe done</b> for <b>{html.escape(name)}</b>: {cleared} chat/group/channel/bot dialog(s) cleared, "
+                     f"{removed} contact(s) removed."]
+            if errors:
+                lines.append(f"⚠️ {len(errors)} item(s) failed: " + ", ".join(errors[:10]))
+            await self.notify("\n".join(lines))
+        finally:
+            self.wiping.discard(phone)
+
     async def logout(self, phone: str) -> str:
         await self.stop_watch(phone)
         try:
@@ -865,6 +916,7 @@ def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
               [("🧾 Activity", f"ev:l:{phone}:0")],
               [("📤 Export session", f"a:exp:{phone}"), ("🗑 Remove", f"a:rm:{phone}")],
               [("🚪 Logout everywhere", f"a:lo:{phone}")],
+              [("💣 Wipe chats/contacts", f"a:wipe:{phone}")],
               [back, ("🏠 Menu", "m")]]
     return txt, kb
 
@@ -1115,6 +1167,24 @@ class SessionManagerBot:
         if sub == "loy":
             msg = await self.mgr.logout(p[2])
             return msg, accounts_screen(self.mgr)[1]
+        if sub == "wipe":
+            phone = p[2]
+            if phone not in self.mgr.store.d["accounts"]:
+                return "I don't manage that account any more.", [[("⬅️ Accounts", "a:l")]]
+            name = (self.mgr.store.d["accounts"].get(phone) or {}).get("name") or phone
+            return (f"💣 <b>Wipe {html.escape(name)}</b>?\nThis <b>permanently</b> deletes every chat (for both sides), leaves every "
+                    "group/channel/bot, and removes every contact. It cannot be undone. The account itself stays logged in - "
+                    "only its chats/contacts/memberships go."), \
+                   [[("✅ Yes, wipe everything", f"a:wipey:{phone}"), ("Cancel", f"a:v:{phone}")]]
+        if sub == "wipey":
+            phone = p[2]
+            acc = self.mgr.store.d["accounts"].get(phone)
+            if acc is None:
+                return "I don't manage that account any more.", [[("⬅️ Accounts", "a:l")]]
+            if phone in self.mgr.wiping:
+                return "Already wiping that account. I'll DM you when it's done.", _nav()
+            asyncio.create_task(self.mgr.wipe_account_task(phone))
+            return f"⏳ Wiping everything on <b>{html.escape(acc.get('name') or phone)}</b> in the background. I'll DM a summary when it's done.", _nav()
         return accounts_screen(self.mgr)
 
     async def ui_login(self, p: list[str]) -> Reply | None:
