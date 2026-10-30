@@ -157,13 +157,29 @@ class Manager:
 
     # -- connections
     async def open(self, phone: str):
+        """Connect to a session file, retrying past a transient sqlite lock (e.g. a stale -journal left by an
+        earlier run that didn't shut down cleanly - a GitHub Actions cache restore can also land one mid-write)."""
         from telethon import TelegramClient
         cr = creds()
         if not cr:
             raise RuntimeError("No TG_API_ID / TG_API_HASH configured.")
-        c = TelegramClient(self.base(phone), cr[0], cr[1])
-        await c.connect()
-        return c
+        base = self.base(phone)
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                c = TelegramClient(base, cr[0], cr[1])
+                await c.connect()
+                return c
+            except Exception as e:                                       # noqa: BLE001  (sqlite3.OperationalError and friends - never imported directly)
+                last = e
+                if attempt == 1:                                          # one cleanup pass, then one more try
+                    for ext in ("-journal", "-wal", "-shm"):
+                        try:
+                            os.remove(base + ".session" + ext)
+                        except FileNotFoundError:
+                            pass
+                await asyncio.sleep(0.3)
+        raise last
 
     async def client_for(self, phone: str):
         """A connected client for one-off calls: the live watcher connection if there is one, else a fresh one the caller must close."""
@@ -605,9 +621,12 @@ def sessions_screen(phone: str, auths: list, page: int) -> Reply:
     if len(auths) > 1:
         kb.append([("🧹 Kill ALL other sessions", f"a:ka:{phone}")])
     kb.append([("🔄 Refresh", f"a:s:{phone}:{page}"), ("⬅️ Account", f"a:v:{phone}")])
+    cur = next((a for a in auths if getattr(a, "current", False)), None)
+    head = (f"📍 <b>This bot's own session</b> was created {ago(cur.date_created)}, last active {ago(cur.date_active)}.\n" if cur and getattr(cur, "date_created", None) else "")
     lines = [f"📱 {a.device_model or a.platform or '?'} ({a.app_name or '?'})" + (" · 📍 this bot" if getattr(a, "current", False) else "")
-             + f"\n   {a.country or '?'} · last active {ago(a.date_active) if getattr(a, 'date_active', None) else '?'}" for a in auths]
-    return f"📟 <b>Active sessions</b> ({len(auths)})\n" + pre(lines), kb
+             + f"\n   {a.country or '?'} · created {ago(a.date_created) if getattr(a, 'date_created', None) else '?'}"
+             f" · last active {ago(a.date_active) if getattr(a, 'date_active', None) else '?'}" for a in auths]
+    return head + f"📟 <b>Active sessions</b> ({len(auths)})\n" + pre(lines), kb
 
 
 class SessionManagerBot:
