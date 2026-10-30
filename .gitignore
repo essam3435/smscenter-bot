@@ -4,3 +4,5 @@ state.json
 .smscenter_bot.json
 .sessionbot_state.json
 sessionbot_sessions/
+__pycache__/
+*.pyc
