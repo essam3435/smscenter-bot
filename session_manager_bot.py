@@ -37,12 +37,13 @@ SESS_DIR = os.environ.get("SESSIONBOT_SESSIONS_DIR") or os.path.join(HERE, "sess
 LOGIN_TTL = 300                      # a half-finished phone login is forgotten after this many seconds
 CLONE_WAIT = 45.0                    # seconds to wait for the code, auto-read off the source account's own session
 CLONE_TTL = 300                      # a half-finished clone (e.g. stuck on a 2FA password) is given up after this long
+PW_TTL = 300                         # a half-finished 2FA set/update/remove is given up after this long
 TG_SERVICE_CHAT = 777000             # Telegram's own "Telegram" service notifications account
 HEALTH_INTERVAL = 1800.0             # how often the background health-check sweeps every account (30 min)
 HEALTH_GAP = 2.0                     # seconds between each account's own check within a sweep, so a big pool doesn't open 100 connections at once
 HEALTH_STALE = HEALTH_INTERVAL * 2   # a health reading older than this counts as "not checked recently" (🟡), not "healthy"
 EVENT_ICON = {"import": "📥", "clone": "🧬", "kill": "🔴", "kill_all": "🧹", "logout": "🚪", "remove": "🗑",
-              "watch": "📡", "code": "📩", "health": "🩺", "validate_all": "🔁", "kill_all_everywhere": "🧹", "wipe": "💣"}
+              "watch": "📡", "code": "📩", "health": "🩺", "validate_all": "🔁", "kill_all_everywhere": "🧹", "wipe": "💣", "pw": "🔒"}
 WIPE_GAP = 0.3                       # seconds between each dialog deleted in a wipe, so a big chat list doesn't trip a flood limit
 BULK_KEY = "*"                       # Store.log() key for an action that isn't about one account (a global sweep)
 
@@ -196,6 +197,18 @@ class Store:
         del ev[:-500]
         self.save(5.0)
 
+    # -- remembered 2FA passwords, sealed at rest, keyed by the real phone number (shared by an account and its clones)
+    def set_pw(self, phone: str, password: str) -> None:
+        self.d.setdefault("pw", {})[phone] = seal(password)
+        self.save()
+
+    def get_pw(self, phone: str) -> str:
+        return unseal(self.d.get("pw", {}).get(phone, ""))
+
+    def clear_pw(self, phone: str) -> None:
+        if self.d.get("pw", {}).pop(phone, None) is not None:
+            self.save()
+
 
 # ── the manager: one TelegramClient per account that is being watched, short-lived ones otherwise ───────
 class Manager:
@@ -207,6 +220,8 @@ class Manager:
         self.login_timer: asyncio.TimerHandle | None = None
         self.clone: dict | None = None             # the one in-progress clone (single admin): read the code from the SOURCE account's own session
         self.clone_timer: asyncio.TimerHandle | None = None
+        self.pw: dict | None = None                # the one in-progress 2FA set/update/remove (single admin)
+        self.pw_timer: asyncio.TimerHandle | None = None
         self.health_task: asyncio.Task | None = None
         self.bulk_running: set[str] = set()        # which admin-triggered sweep ("val" / "kill") is in flight, to refuse a double-tap
         self.wiping: set[str] = set()              # phones currently mid-wipe, to refuse a double-tap on the same account
@@ -214,6 +229,12 @@ class Manager:
 
     def base(self, phone: str) -> str:
         return os.path.join(SESS_DIR, re.sub(r"[^0-9A-Za-z+_#-]", "", phone) or phone)      # keep letters/# too: the id{n} fallback and #2/#3 clone slots must not collide on disk
+
+    def real_phone(self, key: str) -> str:
+        """The real phone number behind an account key (a clone's own key is '<phone>#2', '#3', ...) - 2FA is a whole-account
+        property shared by an account and all its clones, so it's remembered under this, not under whichever key was tapped."""
+        acc = self.store.d["accounts"].get(key) or {}
+        return acc.get("phone") or key.split("#")[0]
 
     def allowed(self, uid: int) -> bool:
         return self.store.d["admin"] == uid
@@ -617,6 +638,8 @@ class Manager:
             self.wiping.discard(phone)
 
     async def logout(self, phone: str) -> str:
+        """Ends THIS BOT'S OWN session on the account and removes it from the bot - telethon's log_out() terminates only the
+        session making the call, not other devices (use end_all_others() / kill_all_others_everywhere() for those)."""
         await self.stop_watch(phone)
         try:
             c = await self.open(phone)
@@ -626,9 +649,58 @@ class Manager:
             await c.log_out()
         except Exception as e:                                           # noqa: BLE001
             return f"❌ Logout failed: {html.escape(type(e).__name__)}."
-        self.store.log(phone, "logout", "logged out everywhere")
+        self.store.log(phone, "logout", "logged out this bot's own session and removed")
         self.remove(phone)
-        return "🚪 Logged out everywhere and removed from the bot."
+        return "🚪 Logged out of this bot's own session and removed it from the bot. Other devices, if any, are untouched."
+
+    # -- 2FA (2-step verification): set / update / remove, remembering the password (sealed) once it's known
+    async def pw_status(self, key: str) -> tuple[bool, bool, str]:
+        """-> (has_password_on_telegram, bot_remembers_it, error-or-'')."""
+        from telethon.tl.functions.account import GetPasswordRequest
+        remembered = bool(self.store.get_pw(self.real_phone(key)))
+        try:
+            c, mine = await self.client_for(key)
+        except Exception as e:                                           # noqa: BLE001
+            return False, remembered, type(e).__name__
+        try:
+            pwd = await c(GetPasswordRequest())
+            return bool(getattr(pwd, "has_password", False)), remembered, ""
+        except Exception as e:                                           # noqa: BLE001
+            return False, remembered, type(e).__name__
+        finally:
+            if mine:
+                await c.disconnect()
+
+    async def apply_pw(self, key: str, mode: str, current: str | None, new: str | None, hint: str) -> tuple[bool, str]:
+        """mode: 'set' | 'update' | 'remove'. -> (ok, error-or-'')."""
+        from telethon.errors import PasswordHashInvalidError
+        phone = self.real_phone(key)
+        try:
+            c, mine = await self.client_for(key)
+        except Exception as e:                                           # noqa: BLE001
+            return False, type(e).__name__
+        try:
+            if mode == "remove":
+                ok = await c.edit_2fa(current_password=current)
+            elif mode == "set":
+                ok = await c.edit_2fa(new_password=new, hint=hint)
+            else:
+                ok = await c.edit_2fa(current_password=current, new_password=new, hint=hint)
+            if not ok:
+                return False, "Telegram rejected the change (wrong current password?)"
+            if mode == "remove":
+                self.store.clear_pw(phone)
+            else:
+                self.store.set_pw(phone, new)
+            self.store.log(key, "pw", f"2FA {mode}")
+            return True, ""
+        except PasswordHashInvalidError:
+            return False, "Wrong current password"
+        except Exception as e:                                           # noqa: BLE001
+            return False, type(e).__name__
+        finally:
+            if mine:
+                await c.disconnect()
 
     def remove(self, phone: str) -> None:
         for ext in (".session", ".session-journal"):
@@ -743,6 +815,7 @@ class Manager:
         except Exception as e:                                           # noqa: BLE001
             await self._cleanup_clone()
             return True, f"❌ Clone failed: {html.escape(type(e).__name__)}."
+        self.store.set_pw(clone["phone"], password)                      # now known - remembered for future 2FA prompts on this account
         await self._finish_clone_success()
         return True, "✅ Done - check the notification above."
 
@@ -904,18 +977,20 @@ def account_card(mgr: Manager, phone: str, note: str = "") -> Reply:
     watch = bool(acc.get("watch"))
     src = acc.get("clone_of")
     src_name = (mgr.store.d["accounts"].get(src) or {}).get("name") if src else None
+    remembered_pw = bool(mgr.store.get_pw(group_of(phone, acc)))
     txt = (f"👤 <b>{html.escape(acc.get('name') or phone)}</b>\n📞 <code>{html.escape(acc.get('phone') or phone)}</code>\n"
            + (f"🧬 Clone of {html.escape(src_name or src)}\n" if src else "")
-           + f"Added {ago(acc.get('added_at') or time.time())}\n🩺 Health: {health_word(acc)}\n📡 OTP watch: {'ON' if watch else 'off'}"
+           + f"Added {ago(acc.get('added_at') or time.time())}\n🩺 Health: {health_word(acc)}\n📡 OTP watch: {'ON' if watch else 'off'}\n"
+           + f"🔒 2FA password: {'remembered' if remembered_pw else 'not remembered'}"
            + (f"\n\n{note}" if note else ""))
     group = group_of(phone, acc)
     back = ("⬅️ Sessions on this account", f"a:g:{group}") if len(account_groups(mgr).get(group, [])) > 1 else ("⬅️ Accounts", "a:l")
     kb: KB = [[("🔁 Validate", f"a:val:{phone}"), ("📟 Sessions", f"a:s:{phone}:0")],
-              [(("📡 Watch: ON" if watch else "📡 Watch: off"), f"a:w:{phone}")],
+              [(("📡 Watch: ON" if watch else "📡 Watch: off"), f"a:w:{phone}"), ("🔒 2FA", f"a:pw:{phone}")],
               [("🧬 Clone session", f"cl:start:{phone}")],
               [("🧾 Activity", f"ev:l:{phone}:0")],
               [("📤 Export session", f"a:exp:{phone}"), ("🗑 Remove", f"a:rm:{phone}")],
-              [("🚪 Logout everywhere", f"a:lo:{phone}")],
+              [("🚪 Logout this session & remove", f"a:lo:{phone}")],
               [("💣 Wipe chats/contacts", f"a:wipe:{phone}")],
               [back, ("🏠 Menu", "m")]]
     return txt, kb
@@ -971,6 +1046,21 @@ def sessions_screen(phone: str, auths: list, page: int) -> Reply:
     return head + f"📟 <b>Active sessions</b> ({len(auths)})\n" + pre(lines), kb
 
 
+def pw_screen(key: str, has_pw: bool, remembered: bool, note: str = "") -> Reply:
+    txt = ("🔒 <b>2-step verification</b>\n"
+           + (f"Currently: <b>ON</b> - {'password remembered, I can act without asking' if remembered else 'password NOT remembered, I will ask for it'}\n"
+              if has_pw else "Currently: <b>off</b>\n")
+           + (f"\n{note}" if note else ""))
+    kb: KB = []
+    if has_pw:
+        kb.append([("✏️ Update password", f"a:pwu:{key}")])
+        kb.append([("🧹 Remove 2FA", f"a:pwr:{key}")])
+    else:
+        kb.append([("➕ Set 2FA password", f"a:pws:{key}")])
+    kb.append([("⬅️ Account", f"a:v:{key}")])
+    return txt, kb
+
+
 class SessionManagerBot:
     def __init__(self, mgr: Manager):
         self.mgr = mgr
@@ -999,6 +1089,14 @@ class SessionManagerBot:
         if clone and clone.get("stage") == "pw" and not cmd.startswith("/"):
             done, msg = await self.mgr.clone_sign_in_password(text)
             return msg, (_nav() if done else [[("Cancel", "cl:x")]])
+        pw = self.mgr.pw
+        if pw and not cmd.startswith("/"):
+            if pw["stage"] == "current":
+                return await self.pw_got_current(text)
+            if pw["stage"] == "new":
+                return await self.pw_got_new(text)
+            if pw["stage"] == "hint":
+                return await self.pw_got_hint(text)
         return "Use the buttons (/menu).", _nav()
 
     def arm_login(self) -> None:
@@ -1025,6 +1123,87 @@ class SessionManagerBot:
                 await login["client"].disconnect()
             except Exception:                                            # noqa: BLE001
                 pass
+
+    def arm_pw(self) -> None:
+        if self.mgr.pw_timer:
+            self.mgr.pw_timer.cancel()
+        self.mgr.pw_timer = asyncio.get_running_loop().call_later(PW_TTL, lambda: asyncio.create_task(self.pw_expire()))
+
+    async def pw_expire(self) -> None:
+        self.mgr.pw = None
+        await self.mgr.notify("⏱ The 2FA change timed out. Open the account → 🔒 2FA to try again.")
+
+    async def drop_pw(self) -> None:
+        if self.mgr.pw_timer:
+            self.mgr.pw_timer.cancel()
+            self.mgr.pw_timer = None
+        self.mgr.pw = None
+
+    async def pw_menu(self, key: str) -> Reply:
+        if key not in self.mgr.store.d["accounts"]:
+            return "I don't manage that account any more.", [[("⬅️ Accounts", "a:l")]]
+        has_pw, remembered, err = await self.mgr.pw_status(key)
+        note = f"⚠️ Couldn't confirm the current status ({html.escape(err)}) - showing the last known state." if err else ""
+        return pw_screen(key, has_pw, remembered, note)
+
+    async def pw_start(self, key: str, mode: str) -> Reply:
+        if key not in self.mgr.store.d["accounts"]:
+            return "I don't manage that account any more.", [[("⬅️ Accounts", "a:l")]]
+        if self.mgr.pw:
+            return "A 2FA change is already in progress. Cancel it first.", [[("Cancel", "a:pwx")]]
+        has_pw, _remembered, _err = await self.mgr.pw_status(key)
+        remembered = self.mgr.store.get_pw(self.mgr.real_phone(key))
+        if mode in ("update", "remove") and not has_pw:
+            return "This account doesn't have 2FA set.", [[("⬅️ Account", f"a:v:{key}")]]
+        if mode == "set" and has_pw:
+            return "This account already has 2FA. Use Update or Remove instead.", [[("⬅️ Account", f"a:v:{key}")]]
+        self.mgr.pw = {"key": key, "mode": mode, "stage": "new" if mode != "remove" else "confirm",
+                       "current": remembered or None, "new": None, "hint": ""}
+        self.arm_pw()
+        if mode == "remove":
+            if remembered:
+                return ("🧹 Remove 2FA from this account using the password I remember? You'd need to set it again to turn 2FA back on."), \
+                       [[("✅ Yes, remove it", "a:pwgo"), ("Cancel", "a:pwx")]]
+            self.mgr.pw["stage"] = "current"
+            return "🔑 I don't have this account's current password remembered. Send it now to remove 2FA. I delete your message right after.", \
+                   [[("Cancel", "a:pwx")]]
+        if mode == "update" and not remembered:
+            self.mgr.pw["stage"] = "current"
+            return "🔑 Send the CURRENT 2FA password first. I delete your message right after.", [[("Cancel", "a:pwx")]]
+        return "🔒 Send the NEW 2FA password. I delete your message right after.", [[("Cancel", "a:pwx")]]
+
+    async def pw_got_current(self, text: str) -> Reply:
+        pw = self.mgr.pw
+        self.arm_pw()
+        pw["current"] = text
+        if pw["mode"] == "remove":
+            return await self.pw_finish()
+        pw["stage"] = "new"
+        return "🔒 Now send the NEW 2FA password. I delete your message right after.", [[("Cancel", "a:pwx")]]
+
+    async def pw_got_new(self, text: str) -> Reply:
+        pw = self.mgr.pw
+        self.arm_pw()
+        if not text:
+            return "Password can't be empty. Send it again.", [[("Cancel", "a:pwx")]]
+        pw["new"] = text
+        pw["stage"] = "hint"
+        return "💡 Send a hint Telegram can show when asking for this password, or send - to skip.", [[("Cancel", "a:pwx")]]
+
+    async def pw_got_hint(self, text: str) -> Reply:
+        self.mgr.pw["hint"] = "" if text.strip() == "-" else text.strip()
+        return await self.pw_finish()
+
+    async def pw_finish(self) -> Reply:
+        pw = self.mgr.pw
+        if not pw:
+            return "No 2FA change in progress.", _nav()
+        ok, err = await self.mgr.apply_pw(pw["key"], pw["mode"], pw.get("current"), pw.get("new"), pw.get("hint", ""))
+        await self.drop_pw()
+        if not ok:
+            return f"❌ Couldn't change 2FA: {html.escape(err)}.", [[("⬅️ Account", f"a:v:{pw['key']}")]]
+        label = {"set": "set", "update": "updated", "remove": "removed"}[pw["mode"]]
+        return f"🔒 2FA {label}.", [[("⬅️ Account", f"a:v:{pw['key']}")]]
 
     @staticmethod
     def keypad(extra: KB | None = None) -> KB:
@@ -1162,11 +1341,25 @@ class SessionManagerBot:
             return "🗑 Removed.", accounts_screen(self.mgr)[1]
         if sub == "lo":
             name = (self.mgr.store.d["accounts"].get(p[2]) or {}).get("name") or p[2]
-            return f"🚪 Log <b>{html.escape(name)}</b> out everywhere? This ends every device, including this bot's own session.", \
+            return (f"🚪 Log <b>{html.escape(name)}</b> out of just this bot's own session and remove it from the bot? "
+                    "Other devices stay logged in - use 🧹 Kill ALL other sessions first if you want those gone too."), \
                    [[("✅ Yes, log out", f"a:loy:{p[2]}"), ("Cancel", f"a:v:{p[2]}")]]
         if sub == "loy":
             msg = await self.mgr.logout(p[2])
             return msg, accounts_screen(self.mgr)[1]
+        if sub == "pw":
+            return await self.pw_menu(p[2])
+        if sub == "pws":
+            return await self.pw_start(p[2], "set")
+        if sub == "pwu":
+            return await self.pw_start(p[2], "update")
+        if sub == "pwr":
+            return await self.pw_start(p[2], "remove")
+        if sub == "pwgo":
+            return await self.pw_finish()
+        if sub == "pwx":
+            await self.drop_pw()
+            return "Cancelled.", _nav()
         if sub == "wipe":
             phone = p[2]
             if phone not in self.mgr.store.d["accounts"]:
@@ -1286,6 +1479,7 @@ class SessionManagerBot:
             await self.drop_login()
             log.warning("2fa failed: %s", type(e).__name__)
             return f"❌ Login failed: {html.escape(type(e).__name__)}.", _nav()
+        self.mgr.store.set_pw(login["phone"], text)                      # now known - remembered for future 2FA prompts on this account
         return await self.finish_login()
 
     async def finish_login(self) -> Reply:
@@ -1358,8 +1552,9 @@ async def main() -> int:
     @dp.message(F.text, F.chat.type == "private")
     async def on_text(m: Message):
         was_clone_pw = bool(mgr.clone and mgr.clone.get("stage") == "pw")   # capture before handle() can resolve (and clear) it
+        was_pw = mgr.pw is not None
         res = await sb.handle(m.from_user.id, m.text)
-        if mgr.login or was_clone_pw:
+        if mgr.login or was_clone_pw or was_pw:
             try:
                 await m.delete()                                          # phone / password must not stay in the chat
             except Exception:                                             # noqa: BLE001
