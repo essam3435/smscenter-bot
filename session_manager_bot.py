@@ -820,6 +820,7 @@ def accounts_screen(mgr: Manager) -> Reply:
         cc = guess_cc(phone)
         label = f"{group_dot(mgr, keys)}{flag(cc)}" + (f" {cc.upper()}" if cc else "") + f" · {name[:16]} · {phone} · {len(keys)} 🔐"
         kb.append([(label[:64], f"a:v:{keys[0]}" if len(keys) == 1 else f"a:g:{phone}")])
+    kb.append([("✅ Validate all", "ga:val"), ("🧹 Kill others (all)", "ga:kill")])
     kb.append([("➕ Add account", "a:add")])
     kb.append([("🏠 Menu", "m")])
     return f"📂 <b>Accounts</b> ({len(groups)})\n<i>🟢 healthy · 🟡 check pending · 🔴 needs attention - the number = sessions on that account</i>", kb
