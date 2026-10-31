@@ -81,8 +81,10 @@ def parse_report(text: str) -> dict[str, tuple[str, str]]:
             continue
         if label in ("fresh",):
             section = "fresh"; continue
-        if label.startswith("registered"):
+        if label.startswith("registered") or label.startswith("used"):
             section = "registered"; continue
+        if label.startswith("banned"):
+            section = "banned"; continue
         if label in ("other", "others"):
             section = "other"; continue
         m = _NUM.search(line)
@@ -94,6 +96,8 @@ def parse_report(text: str) -> dict[str, tuple[str, str]]:
             out[phone] = ("clean", detail)
         elif section == "registered":
             out[phone] = ("registered", detail)
+        elif section == "banned":
+            out[phone] = ("banned", detail or "banned")
         else:
             out[phone] = ("banned" if "BANNED" in detail.upper() else "unknown", detail or "other result")
     return out
