@@ -117,6 +117,10 @@ HUNT_FATAL = {"apiKeyNotFound": "SmsCenter rejected your API key",
               "badData": "SmsCenter rejected the request"}
 HUNT_FATAL.update({"nhKeyBad": "NumberHub rejected your API key", "dailyLimit": "NumberHub: this API key's daily spending limit is reached",
                    "duplicateOrder": "NumberHub: 50 orders are already open for this platform + country (rejected numbers stay held ~2 min) - wait, or use a slower interval"})
+HUNT_FATAL.update({"pvKeyBad": "PVAPins rejected your API key", "pvBadService": "this platform isn't offered by PVAPins",
+                   "pvBadCountry": "PVAPins doesn't know this country", "pvInFlight": "PVAPins: an order for this exact request is still being placed - try again shortly",
+                   "pvRateLimited": "PVAPins: too many requests - slow the hunter's interval down",
+                   "pvSupplierDown": "PVAPins: that operator's supplier is temporarily disabled - try another operator"})
 WATCH_MIN = 15.0                                        # a price watch scans ~250 countries each time, so it can't be as fast as a single track
 WATCH_PRESETS = (30, 60, 120, 300, 600)
 WATCH_CONC = 8                                          # parallel country requests during a scan
@@ -196,7 +200,7 @@ def flag(code: str) -> str:
 
 PROV_NAME = {"sc": "SmsCenter", "nh": "NumberHub", "pv": "PVAPins"}
 PROV_DEFAULT = {"nh": "all", "pv": "list"}               # who may use a provider: "all" users, or "list" = the admin + the listed ids (PVAPins starts admin-only)
-PROV_READY = {"sc": True, "nh": True, "pv": False}
+PROV_READY = {"sc": True, "nh": True, "pv": True}
 WEB_SITES = (("sc", "SmsCenter", "api_key"), ("nh", "NumberHub", "nh_key"), ("pv", "PVAPins", "pv_key"))   # (provider, name, profile field of its sealed key)
 
 
@@ -872,6 +876,109 @@ class NumberHub:
         return "ready"
 
 
+PV_URL = "https://api.pvapins.com/api/v1"
+PV_ERR = {"NO_BALANCE": "noMoney", "NO_NUMBERS": "noNumber", "BAD_SERVICE": "pvBadService", "BAD_COUNTRY": "pvBadCountry",
+          "BAD_OPERATOR": "noOperator", "IN_FLIGHT": "pvInFlight", "RATE_LIMITED": "pvRateLimited", "SUPPLIER_DISABLED": "pvSupplierDown"}
+
+
+class PVAPins:
+    """pvapins.com REST API v1 (api_key header auth) with the same get_number / v0_status / sms_code / set_status / balance / offer
+    shape the hunter uses on SmsCenter / NumberHub. Its published docs have no cancel/reject endpoint for this API, unlike the two
+    others - see set_status()."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.http = httpx.AsyncClient(timeout=25.0, headers={"X-API-Key": api_key})
+
+    async def close(self):
+        await self.http.aclose()
+
+    async def req(self, method: str, path: str, body: dict | None = None, idem: str | None = None, **params) -> Any:
+        try:
+            r = await self.http.request(method, PV_URL + path, params={k: v for k, v in params.items() if v not in (None, "")} or None,
+                                        json=body, headers={"Idempotency-Key": idem} if idem else None)
+            data = r.json()
+        except httpx.HTTPError as e:
+            raise SmsCenterError(f"network error: {redact(e)}") from e
+        except ValueError:
+            raise SmsCenterError(f"bad response (HTTP {r.status_code})")
+        if r.status_code >= 400:
+            err = data.get("error") if isinstance(data, dict) else None
+            code = (err.get("code") if isinstance(err, dict) else err) or f"HTTP {r.status_code}"
+            mapped = PV_ERR.get(str(code)) or ("pvKeyBad" if r.status_code == 401 else None)
+            raise SmsCenterError(mapped or str(code))
+        return data
+
+    async def services(self) -> dict[str, str]:
+        data = await self.req("GET", "/services")
+        return {str(x["code"]): str(x.get("name") or x["code"]) for x in (data.get("services") or []) if isinstance(x, dict) and x.get("code")}
+
+    async def countries_for(self, svc: str) -> list[dict]:
+        """Every country that offers this service, from the bulk Availability endpoint -> [{"code","name","available"}]."""
+        data = await self.req("GET", "/numbers", service=svc)
+        return [c for c in (data.get("countries") or []) if isinstance(c, dict) and c.get("code")]
+
+    async def operators(self, cc: str, svc: str) -> list[dict]:
+        """One route, single-route mode (has 'label') -> [{"operator","label","price","count"}]. count=None means unknown stock, not zero."""
+        data = await self.req("GET", "/operators", country=cc, service=svc)
+        return [o for o in (data.get("operators") or []) if isinstance(o, dict)]
+
+    async def offer(self, svc: str, cc: str) -> dict | None:
+        """-> {"min", "api", "stock", "tiers"} like SmsCenter's offer. An operator with unknown count (null) is treated as 1 in stock -
+        it is still buyable per the docs, just without an exact figure."""
+        tiers = sorted((float(o["price"]), int(o["count"]) if o.get("count") is not None else 1)
+                       for o in await self.operators(cc, svc) if _num(o.get("price")) is not None)
+        if not tiers:
+            return None
+        stock = sum(c for _, c in tiers)
+        cheapest = next((p for p, c in tiers if c > 0), tiers[0][0])
+        return {"min": cheapest, "api": tiers[0][0], "stock": stock, "tiers": tiers}
+
+    async def get_number(self, svc: str, cc: str, operator: str | None = None, max_price: float | None = None) -> dict:
+        """POST /orders (spends balance at once) -> {"tel", "idNum", "price"}. `operator` is a displayId (int) from operators()."""
+        body: dict[str, Any] = {"country": str(cc), "service": svc}
+        if operator and operator != "-":
+            try:
+                body["operator"] = int(operator)
+            except ValueError:
+                pass
+        data = await self.req("POST", "/orders", body, idem=uuid.uuid4().hex)
+        if not isinstance(data, dict) or not data.get("phoneNumber") or not data.get("id"):
+            raise SmsCenterError("badResponse")
+        return {"tel": str(data["phoneNumber"]).lstrip("+"), "idNum": str(data["id"]), "price": _num(data.get("price"))}
+
+    async def balance(self) -> float | None:
+        data = await self.req("GET", "/account")
+        return _num(data.get("balance")) if isinstance(data, dict) else None
+
+    async def order(self, id_num: str) -> dict:
+        data = await self.req("GET", f"/orders/{id_num}")
+        return data if isinstance(data, dict) else {}
+
+    async def v0_status(self, id_num: str) -> tuple[str, str | None]:
+        """('ok', code) | ('wait', None) | ('cancel', None) = cancelled/expired | ('?', None)."""
+        o = await self.order(id_num)
+        code = o.get("otpCode")
+        if code:
+            return "ok", str(code)
+        if str(o.get("status") or "") in ("cancelled", "expired"):
+            return "cancel", None
+        if str(o.get("status") or "") in ("pending", "active"):
+            return "wait", None
+        return "?", None
+
+    async def sms_code(self, id_num: str) -> str | None:
+        c = (await self.order(id_num)).get("otpCode")
+        return str(c) if c else None
+
+    async def set_status(self, id_num: str, status: str) -> str:
+        """PVAPins' REST v1 has no cancel/reject endpoint (confirmed against its published API docs): a number that doesn't match
+        the hunter's filter cannot be released early - it stays active and billed until it expires (~20 min) or gets a code. This
+        always raises so the caller (release_quiet / the manual Release button) treats it exactly like "could not release": the
+        number is recorded as kept (paid, yours) instead of a cancel that never actually happened."""
+        raise SmsCenterError("PVAPins has no cancel endpoint - this number stays active and billed until it expires (~20 min) or gets a code")
+
+
 def parse_offer(svc: str, data) -> dict | None:
     o = data.get(svc) if isinstance(data, dict) else None
     if not isinstance(o, dict):
@@ -1276,7 +1383,8 @@ class App:
             "/set [platform] &lt;country&gt; under 1.20 | off\n/set [platform] &lt;country&gt; every 10 (seconds) | default\n"
             "/trend [platform] &lt;country&gt; · /interval &lt;sec&gt; (default) · /drop &lt;%&gt; (default) · /mute &lt;min|off&gt;\n"
             "/watch [platform] &lt;price&gt; - tell me every country under that price, then only the changes · /watches · /unwatch &lt;id|all&gt;\n"
-            "/hunter - buy numbers with a hunter (prefix, max price, how many, how often) · /history\n/setkey &lt;apikey&gt; · /nhkey &lt;NumberHub key&gt; (hunt on NumberHub with your own wallet) · /check · /pause (monitoring only) · /resume · /status\nOr just type a country or platform name to find it.")
+            "/hunter - buy numbers with a hunter (prefix, max price, how many, how often) · /history\n/setkey &lt;apikey&gt; · /nhkey &lt;NumberHub key&gt; (hunt on NumberHub with your own wallet) · "
+            "/pvkey &lt;PVAPins key&gt; (hunt on PVAPins with your own wallet) · /check · /pause (monitoring only) · /resume · /status\nOr just type a country or platform name to find it.")
 
     def __init__(self, state: UserState, bot=None, uid: int = 0, client_factory=None):
         self.s, self.bot, self.uid = state, bot, uid
@@ -1317,9 +1425,26 @@ class App:
             return "NumberHub isn't enabled for you. Ask the admin.", _nav()
         return None if self.nh_key() else ("Set your NumberHub API key first:\n<code>/nhkey YOUR_KEY</code>", _nav())
 
+    def pv_key(self) -> str:
+        """This user's own PVAPins key (sealed in their profile, like the SmsCenter key). The admin's key counts for the admin too."""
+        if not self.s.store.prov_ok(self.uid, "pv"):
+            return ""
+        k = unseal(self.s.d.get("pv_key", ""))
+        return k or (unseal(self.s.store.d.get("pv_key", "")) if self.is_admin() else "")
+
+    def need_pv(self) -> Reply | None:
+        if not self.s.store.prov_ok(self.uid, "pv"):
+            return "PVAPins isn't enabled for you. Ask the admin.", _nav()
+        return None if self.pv_key() else ("Set your PVAPins API key first:\n<code>/pvkey YOUR_KEY</code>", _nav())
+
     def client_for(self, o: dict):
-        """The API client for a hunter or a bought number: NumberHub or SmsCenter."""
-        return NumberHub(self.nh_key()) if o.get("prov") == "nh" else self.client_factory()
+        """The API client for a hunter or a bought number: NumberHub, PVAPins, or SmsCenter."""
+        prov = o.get("prov")
+        if prov == "nh":
+            return NumberHub(self.nh_key())
+        if prov == "pv":
+            return PVAPins(self.pv_key())
+        return self.client_factory()
 
     def cancel_later(self, id_num: str) -> None:
         """NumberHub accepts a cancel only ~2 minutes after the number was issued: do it then (the hold is released, no charge)."""
@@ -1868,10 +1993,13 @@ class App:
                 "It buys numbers for you and tells you each one - with a Release button - and sends the code when it arrives.")
         kb = []
         for hid, h in sorted(hs.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
-            kb.append([(f"{'▶️' if h.get('on') else '⏹'} #{hid}{' NH' if h.get('prov') == 'nh' else ''} {h['sname'][:10]} {fl(h)} {h['name'][:12]} · {h['got']}/{h['want']}", f"hu:k:{hid}")])
+            tag = {"nh": " NH", "pv": " PV"}.get(h.get("prov"), "")
+            kb.append([(f"{'▶️' if h.get('on') else '⏹'} #{hid}{tag} {h['sname'][:10]} {fl(h)} {h['name'][:12]} · {h['got']}/{h['want']}", f"hu:k:{hid}")])
         kb.append([("➕ Make hunter", "hu:n:0")])
         if self.s.store.prov_ok(self.uid, "nh"):
             kb.append([("➕ Make NumberHub hunter", "hu:nh:0")])
+        if self.s.store.prov_ok(self.uid, "pv"):
+            kb.append([("➕ Make PVAPins hunter", "hu:pv:0")])
         kb.append([("📜 History", "hi:0"), ("🏠 Menu", "m")])
         return head, kb
 
@@ -1945,10 +2073,11 @@ class App:
                 f"<i>Each line = how many numbers cost that price or less (like the website).</i>", kb)
 
     async def live_prices(self, svc: str, cc: str, prov: str | None = None) -> tuple[str, dict | None]:
-        """The price of this platform in this country from all three endpoints (NumberHub: its one price + stock)."""
-        if prov == "nh":
+        """The price of this platform in this country from all three endpoints (NumberHub / PVAPins: one price + stock)."""
+        if prov in ("nh", "pv"):
+            name = "NumberHub" if prov == "nh" else "PVAPins"
             try:
-                cl = NumberHub(self.nh_key())
+                cl = NumberHub(self.nh_key()) if prov == "nh" else PVAPins(self.pv_key())
                 try:
                     o = await cl.offer(svc, cc)
                 finally:
@@ -1956,7 +2085,7 @@ class App:
             except SmsCenterError as e:
                 return f"prices: {html.escape(str(e))}", None
             if not o:
-                return "Not offered by NumberHub in this country right now.", None
+                return f"Not offered by {name} in this country right now.", None
             return pre([f"{'Price':<16}{usd(o['api']):>9}", f"{'In stock':<16}{('yes' if o['stock'] else 'no'):>9}"]), {"min": o["min"], "api": o["api"], "stock": o["stock"]}
         try:
             cl = self.ui_client()
@@ -1989,13 +2118,16 @@ class App:
         h = self.s.d["hunters"].get(hid)
         if h is None:
             return self.hunters_screen()
-        nh = h.get("prov") == "nh"
-        have = self.nh_key() if nh else self.s.api_key
-        prices, snap = await self.live_prices(h["svc"], h["cc"], h.get("prov")) if have else (("Set the NumberHub key first: /nhkey" if nh else "Set your SmsCenter key first: /setkey"), None)
+        prov = h.get("prov")
+        have = self.nh_key() if prov == "nh" else self.pv_key() if prov == "pv" else self.s.api_key
+        need_msg = {"nh": "Set the NumberHub key first: /nhkey", "pv": "Set the PVAPins key first: /pvkey"}.get(prov, "Set your SmsCenter key first: /setkey")
+        prices, snap = await self.live_prices(h["svc"], h["cc"], prov) if have else (need_msg, None)
         pf = " ".join(filter(None, ["✅ " + ", ".join(h["prefix"]) if h["prefix"] else "", "🚫 " + ", ".join(h["xprefix"]) if h["xprefix"] else ""])) or "any number"
         state = "▶️ <b>hunting</b>" if h.get("on") else "⏹ stopped"
-        txt = (f"🏹 <b>Hunter #{hid}</b> {state}{' · <b>NumberHub</b>' if nh else ''}\n{self.hunter_title(h)}\n"
-               + ("⚠️ NumberHub cancels only ~2 min after a number is issued: numbers that don't match stay held until then (max 50 open per platform + country). With a strict prefix use a slower interval.\n" if nh else "")
+        tag = {"nh": " · <b>NumberHub</b>", "pv": " · <b>PVAPins</b>"}.get(prov, "")
+        warn = {"nh": "⚠️ NumberHub cancels only ~2 min after a number is issued: numbers that don't match stay held until then (max 50 open per platform + country). With a strict prefix use a slower interval.\n",
+                "pv": "⚠️ PVAPins has no cancel endpoint: a number that doesn't match is still billed and stays active until it expires (~20 min). Use a strict prefix/operator to avoid wasting balance.\n"}.get(prov, "")
+        txt = (f"🏹 <b>Hunter #{hid}</b> {state}{tag}\n{self.hunter_title(h)}\n" + warn
                + f"Bought <b>{h['got']}/{h['want']}</b> · requests {h['tries']} · released {h['rejected']} (prefix / price)\n"
                + ("🔔 stops and tells you if the price changes" if h["stopchg"] else "🔕 keeps hunting when the price changes (follows your max price)")
                + ("\n🛡 checks every number (" + self.checker.describe() + ") - banned / registered ones are cancelled and replaced" if h["check"] else "\n🛡 numbers are not checked")
@@ -2028,7 +2160,7 @@ class App:
         if sub == "q":
             self.pending[uid] = ("hcsearch", p[2], "")
             return "🔎 <b>Search country</b>\nType a country name or its code (e.g. <code>ua</code>).", [[("⬅️ Countries", f"hu:cp:{p[2]}:0")]]
-        if sub == "nh":                                                  # NumberHub (admin only): platforms -> countries -> hunter
+        if sub == "nh":                                                  # NumberHub (admin only unless allowed): platforms -> countries -> hunter
             return await self.nh_platforms(int(p[2]))
         if sub == "nhs":
             return await self.nh_countries(p[2], int(p[3]))
@@ -2041,6 +2173,19 @@ class App:
             h["op"] = None if p[3] == "-" else p[3]
             self.s.save()
             return await self.nh_options(p[2])
+        if sub == "pv":                                                  # PVAPins: platforms -> countries -> hunter
+            return await self.pv_platforms(int(p[2]))
+        if sub == "pvs":
+            return await self.pv_countries(p[2], int(p[3]))
+        if sub == "pvc":
+            return await self.pv_create(p[2], p[3])
+        if sub == "pvop":                                                # hu:pvop:<hid>:<operator|->
+            h = hs.get(p[2])
+            if h is None or h.get("prov") != "pv":
+                return self.hunters_screen()
+            h["op"] = None if p[3] == "-" else p[3]
+            self.s.save()
+            return await self.pv_options(p[2])
         if sub == "c":                                                   # country chosen -> create the hunter, ask the operator
             if (r := self.need_key()):
                 return r
@@ -2226,6 +2371,108 @@ class App:
         return (f"🏹 {self.hunter_title(h)} · NumberHub\nStep 3: the price you will pay up to, and the carrier"
                 + ("" if ops else " (this country assigns the carrier itself)") + ". Prefix, quantity and speed are on the next screen."), kb
 
+    async def pv_platforms(self, page: int) -> Reply:
+        if (r := self.need_pv()):
+            return r
+        try:
+            cl = PVAPins(self.pv_key())
+            try:
+                svcs = await cl.services()
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"PVAPins error: {html.escape(str(e))}", [[("⬅️ Hunters", "hu:l")]]
+        items = sorted(svcs.items(), key=lambda kv: (kv[0] != DEFAULT_SVC, kv[0]))
+        pages = max(1, (len(items) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        part = items[page * PER_PAGE:(page + 1) * PER_PAGE]
+        kb: KB = [[(f"{c.upper()} · {n[:14]}", f"hu:pvs:{c}:0") for c, n in part[i:i + 2]] for i in range(0, len(part), 2)]
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"hu:pv:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"hu:pv:{page + 1}"))
+        kb += [nav, [("⬅️ Hunters", "hu:l"), ("🏠 Menu", "m")]]
+        return "🏹 <b>Make PVAPins hunter</b>\nStep 1: pick the platform. Step 2: country. Step 3: price, operator, prefix.", kb
+
+    async def pv_countries(self, svc: str, page: int) -> Reply:
+        if (r := self.need_pv()):
+            return r
+        try:
+            cl = PVAPins(self.pv_key())
+            try:
+                cs = sorted((c for c in await cl.countries_for(svc) if c.get("available")), key=lambda c: str(c.get("name") or "").lower())
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"PVAPins error: {html.escape(str(e))}", [[("⬅️ Platforms", "hu:pv:0")]]
+        pages = max(1, (len(cs) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        part = cs[page * PER_PAGE:(page + 1) * PER_PAGE]
+        lab = lambda c: f"{flag(str(c.get('code') or ''))} {str(c.get('name') or c['code'])[:14]}"   # noqa: E731
+        kb: KB = [[(lab(c), f"hu:pvc:{svc}:{c['code']}") for c in part[i:i + 2]] for i in range(0, len(part), 2)]
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"hu:pvs:{svc}:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"hu:pvs:{svc}:{page + 1}"))
+        kb += [nav, [("⬅️ Platforms", "hu:pv:0"), ("🏠 Menu", "m")]]
+        if not cs:
+            return f"🏹 <b>{html.escape(svc.upper())}</b> · PVAPins\nNo country is available for this platform right now.", [[("⬅️ Platforms", "hu:pv:0"), ("🏠 Menu", "m")]]
+        return f"🏹 <b>{html.escape(svc.upper())}</b> · PVAPins · step 2: pick the country ({len(cs)} available)", kb
+
+    async def pv_create(self, svc: str, cc: str) -> Reply:
+        if (r := self.need_pv()):
+            return r
+        try:
+            cl = PVAPins(self.pv_key())
+            try:
+                svcs, rows = await cl.services(), await cl.countries_for(svc)
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"PVAPins error: {html.escape(str(e))}", [[("⬅️ Platforms", "hu:pv:0")]]
+        row = next((c for c in rows if str(c.get("code")) == cc), None)
+        if row is None:
+            return "PVAPins doesn't offer that country for this platform any more.", [[("⬅️ Platforms", "hu:pv:0")]]
+        hs = self.s.d["hunters"]
+        hid = str(max([int(k) for k in hs if k.isdigit()] or [0]) + 1)
+        h = hs[hid] = new_hunter(hid, svc, svcs.get(svc, svc.upper()), cc, str(row.get("name") or cc))
+        h.update(prov="pv", fl=cc.lower(), interval=max(3.0, float(self.s.d.get("hunt_interval") or 1.0)))
+        self.s.save()
+        return await self.pv_options(hid)
+
+    async def pv_options(self, hid: str) -> Reply:
+        """Step 3 for a PVAPins hunter: its price (tap = max price) and the operator (PVAPins displayId)."""
+        h = self.s.d["hunters"].get(hid)
+        if h is None:
+            return self.hunters_screen()
+        try:
+            cl = PVAPins(self.pv_key())
+            try:
+                ops = await cl.operators(h["cc"], h["svc"])
+            finally:
+                await cl.close()
+        except SmsCenterError as e:
+            return f"PVAPins error: {html.escape(str(e))}", [[("⬅️ Back to the hunter", f"hu:k:{hid}")]]
+        kb: KB = []
+        seen = set()
+        for pr, _c in sorted({(_num(o.get("price")), o.get("count")) for o in ops if _num(o.get("price")) is not None}):
+            if pr in seen:
+                continue
+            seen.add(pr)
+            kb.append([(f"{'✅ ' if h['maxp'] and abs(h['maxp'] - pr) < 1e-9 else ''}Max price = {usd(pr)}", f"hu:pr:{hid}:{pr:g}")])
+        kb.append([("♾ No price limit", f"hu:pr:{hid}:0")])
+        if ops:
+            kb.append([(("✅ " if not h["op"] else "") + "Any operator", f"hu:pvop:{hid}:-")])
+            opitems = [(f"{(o.get('label') or o['operator'])}: {usd(_num(o.get('price')))}"[:24], str(o["operator"])) for o in ops if o.get("operator") is not None]
+            kb += [[((("✅ " if h["op"] == d else "") + t), f"hu:pvop:{hid}:{d}") for t, d in opitems[i:i + 2]] for i in range(0, len(opitems), 2)]
+        kb.append([("➡️ Continue to the hunter", f"hu:k:{hid}")])
+        return (f"🏹 {self.hunter_title(h)} · PVAPins\nStep 3: the price you will pay up to, and the operator"
+                + ("" if ops else " (no operators listed for this route)") + ". Prefix, quantity and speed are on the next screen."), kb
+
     def prefix_screen(self, uid: int, hid: str, mode: str = "in") -> Reply:
         """Two lists: ✅ 'only these' (empty = any) and 🚫 'never these'. The next prefix you type is added to the list in `mode`."""
         h = self.s.d["hunters"][hid]
@@ -2309,7 +2556,8 @@ class App:
 
     async def start_hunter(self, hid: str) -> Reply:
         h = self.s.d["hunters"][hid]
-        if (r := (self.need_nh() if h.get("prov") == "nh" else self.need_key())):
+        prov = h.get("prov")
+        if (r := (self.need_nh() if prov == "nh" else self.need_pv() if prov == "pv" else self.need_key())):
             return r
         if hid in self.hunts and not self.hunts[hid].done():
             return await self.hunter_card(hid)
@@ -2803,7 +3051,7 @@ class App:
         for e in self.s.d["history"]:
             if e.get("chk") == "pending":
                 e["chk"], e["chk_note"] = "unknown", "the bot restarted before the check finished"
-            if e["state"] == "active" and e["idNum"] not in self.code_tasks and (self.s.api_key or e.get("prov") == "nh"):
+            if e["state"] == "active" and e["idNum"] not in self.code_tasks and (self.s.api_key or e.get("prov") in ("nh", "pv")):
                 self.code_tasks[e["idNum"]] = asyncio.create_task(self.wait_code(e["idNum"]))
 
     async def release(self, id_num: str) -> Reply:
@@ -3270,10 +3518,10 @@ class App:
     def site_key(self, prov: str) -> str:
         if not self.site_ok(prov):
             return ""
-        return {"sc": lambda: self.s.api_key, "nh": self.nh_key, "pv": lambda: unseal(self.s.d.get("pv_key", ""))}[prov]()
+        return {"sc": lambda: self.s.api_key, "nh": self.nh_key, "pv": self.pv_key}[prov]()
 
     async def save_key(self, prov: str, key: str) -> tuple[str | None, str]:
-        """-> (error or None, info). SmsCenter / NumberHub keys are tested against the site; PVAPins has no integration yet, so its key is only stored."""
+        """-> (error or None, info). The key is tested against the matching site before it's stored."""
         key = key.strip()
         if len(key) < 8 or " " in key:
             return "That doesn't look like an API key.", ""
@@ -3293,7 +3541,13 @@ class App:
             finally:
                 await cl.close()
         else:
-            info = "Stored for when PVAPins is connected (it isn't tested yet)."
+            cl = PVAPins(key)
+            try:
+                info = f"Balance {usd(await cl.balance())}."
+            except SmsCenterError as e:
+                return f"PVAPins didn't accept that key ({html.escape(str(e))}).", ""
+            finally:
+                await cl.close()
         self.s.set_secret(dict((a, c) for a, _, c in WEB_SITES)[prov], key)
         self.s.store.log(self.uid, "key", f"{PROV_NAME[prov]} key set")
         if prov == "sc":
@@ -3306,16 +3560,14 @@ class App:
         if key and prov == "sc":
             b = await check_key(key)
             bal = usd(b) if b is not None else "couldn't read it"
-        elif key and prov == "nh":
-            cl = NumberHub(key)
+        elif key and prov in ("nh", "pv"):
+            cl = NumberHub(key) if prov == "nh" else PVAPins(key)
             try:
                 bal = usd(await cl.balance())
             except SmsCenterError:
                 bal = "couldn't read it (check the key)"
             finally:
                 await cl.close()
-        elif key:
-            bal = "n/a (not connected yet)"
         txt = (f"🔑 <b>{name} API</b>{'' if PROV_READY[prov] else ' <i>(not connected yet)</i>'}\n"
                + (f"Key: set ✅ (…{html.escape(key[-4:])})\n💰 Balance: {bal}" if key else "Key: not set ❗")
                + ("" if PROV_READY[prov] else "\n⚠️ <b>Not connected yet</b>: there is no hunter for it and nothing is bought. The key is only saved for later.")
@@ -3327,6 +3579,8 @@ class App:
             kb.append([("🏹 Make hunter", "hu:n:0"), ("📱 Platforms", "pl:0")])
         elif prov == "nh":
             kb.append([("🏹 Make hunter", "hu:nh:0"), ("🏹 My hunters", "hu:l")])
+        elif prov == "pv":
+            kb.append([("🏹 Make hunter", "hu:pv:0"), ("🏹 My hunters", "hu:l")])
         kb.append([("🏠 Menu", "m")])
         return txt, kb
 
@@ -3384,6 +3638,25 @@ class App:
         self.s.set_secret("nh_key", k)
         self.s.store.log(self.uid, "key", "NumberHub key set")
         return f"✅ NumberHub key saved (your message is deleted). Available balance: {usd(bal)}.\nMake a hunter: 🏹 Hunter → ➕ Make NumberHub hunter.", _nav(("🏹 Hunter", "hu:l"))
+
+    async def cmd_pvkey(self, arg: str) -> Reply:
+        """/pvkey <key>: this user's own PVAPins key (validated with GET /account, stored sealed, the message is deleted)."""
+        self.wipe_input = True                                           # the key must not stay in the chat, even when it is refused
+        if not self.s.store.prov_ok(self.uid, "pv"):
+            return "PVAPins isn't enabled for you. Ask the admin.", _nav()
+        k = arg.strip()
+        if not k:
+            return ("PVAPins key: set ✅" if self.pv_key() else "PVAPins key: not set ❗") + "\nUsage: <code>/pvkey YOUR_KEY</code> (your own key from pvapins.com → dashboard → API). I delete your message.", _nav()
+        cl = PVAPins(k)
+        try:
+            bal = await cl.balance()
+        except SmsCenterError as e:
+            return f"❌ PVAPins didn't accept that key ({html.escape(str(e))}). Nothing was changed.", _nav()
+        finally:
+            await cl.close()
+        self.s.set_secret("pv_key", k)
+        self.s.store.log(self.uid, "key", "PVAPins key set")
+        return f"✅ PVAPins key saved (your message is deleted). Balance: {usd(bal)}.\nMake a hunter: 🏹 Hunter → ➕ Make PVAPins hunter.", _nav(("🏹 Hunter", "hu:l"))
 
     async def cmd_status(self, arg: str = "") -> Reply:
         return self.main_screen()
