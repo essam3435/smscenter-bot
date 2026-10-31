@@ -2837,7 +2837,8 @@ class App:
         if st == "code" and e.get("code"):
             kb[0].append(("📋 Copy code", f"copy:{e['code']}"))
         if st == "active":
-            kb.append([("🔓 Release (cancel + balance back)", f"rl:{e['idNum']}")])
+            rel_label = "🔓 Release (PVAPins can't cancel early - won't refund)" if e.get("prov") == "pv" else "🔓 Release (cancel + balance back)"
+            kb.append([(rel_label, f"rl:{e['idNum']}")])
         return "\n".join(x for x in lines if x), kb
 
     async def refresh_card(self, e: dict) -> None:
