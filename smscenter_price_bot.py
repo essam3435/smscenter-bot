@@ -2402,7 +2402,9 @@ class App:
         try:
             cl = PVAPins(self.pv_key())
             try:
-                cs = sorted((c for c in await cl.countries_for(svc) if c.get("available")), key=lambda c: str(c.get("name") or "").lower())
+                rows = await cl.countries_for(svc)
+                live = any(c.get("available") for c in rows)         # the bulk list often reports 0 for every country; the real stock/price shows once a route is picked
+                cs = sorted((c for c in rows if c.get("available")) if live else rows, key=lambda c: str(c.get("name") or "").lower())
             finally:
                 await cl.close()
         except SmsCenterError as e:
@@ -2421,7 +2423,7 @@ class App:
         kb += [nav, [("⬅️ Platforms", "hu:pv:0"), ("🏠 Menu", "m")]]
         if not cs:
             return f"🏹 <b>{html.escape(svc.upper())}</b> · PVAPins\nNo country is available for this platform right now.", [[("⬅️ Platforms", "hu:pv:0"), ("🏠 Menu", "m")]]
-        return f"🏹 <b>{html.escape(svc.upper())}</b> · PVAPins · step 2: pick the country ({len(cs)} available)", kb
+        return f"🏹 <b>{html.escape(svc.upper())}</b> · PVAPins · step 2: pick the country ({len(cs)} {'available' if live else 'listed - stock shows after you pick one'})", kb
 
     async def pv_create(self, svc: str, cc: str) -> Reply:
         if (r := self.need_pv()):
